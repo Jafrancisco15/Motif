@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mentor Coffee Scale • Web Bluetooth</title>
+    <meta name="theme-color" content="#111827">
+    <style>
+      :root{color-scheme:dark light}
+      body{font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial,Apple Color Emoji,Segoe UI Emoji; 
+           background:#0b1020; color:#f8fafc; margin:0; padding:0}
+      .container{max-width:960px;margin:0 auto;padding:24px}
+      .card{background:#101935;border:1px solid #1e2a55;border-radius:16px;padding:20px;box-shadow:0 10px 25px rgba(0,0,0,.25)}
+      .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+      button{background:#334155;border:none;border-radius:10px;color:#fff;padding:10px 14px;cursor:pointer}
+      button.primary{background:#2563eb}
+      button:disabled{opacity:.5;cursor:not-allowed}
+      input[type=text]{padding:8px 10px;border-radius:10px;border:1px solid #314061;background:#0f172a;color:#e2e8f0}
+      .pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#0f172a;border:1px solid #1f2b55}
+      .grid{display:grid;grid-template-columns:1fr 1fr; gap:16px}
+      .metric{font-size:40px; font-weight:800}
+      .sub{opacity:.75;font-size:12px}
+      a{color:#93c5fd}
+      .footer{opacity:.6;font-size:12px;margin-top:24px;text-align:center}
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
