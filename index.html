@@ -1,7 +1,38 @@
 <!doctype html>
-<html lang="es"><head><meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Mentor Coffee Scale • Web Bluetooth</title>
-<meta name="theme-color" content="#111827">
-<style>:root{color-scheme:dark light}body{font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial,Apple Color Emoji,Segoe UI Emoji;background:#0b1020;color:#f8fafc;margin:0;padding:0}.container{max-width:960px;margin:0 auto;padding:24px}.card{background:#101935;border:1px solid #1e2a55;border-radius:16px;padding:20px;box-shadow:0 10px 25px rgba(0,0,0,.25)}.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}button{background:#334155;border:none;border-radius:10px;color:#fff;padding:10px 14px;cursor:pointer}button.primary{background:#2563eb}button:disabled{opacity:.5;cursor:not-allowed}input[type=text]{padding:8px 10px;border-radius:10px;border:1px solid #314061;background:#0f172a;color:#e2e8f0}.pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#0f172a;border:1px solid #1f2b55}.grid{display:grid;grid-template-columns:1fr 1fr; gap:16px}.metric{font-size:40px; font-weight:800}.sub{opacity:.75;font-size:12px}a{color:#93c5fd}.footer{opacity:.6;font-size:12px;margin-top:24px;text-align:center}label{font-size:12px;opacity:.85}.error{background:#7f1d1d;border:1px solid #b91c1c;color:#fecaca;padding:8px 10px;border-radius:10px}</style>
-</head><body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body></html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mentor Coffee Scale • Web Bluetooth (v4)</title>
+    <meta name="theme-color" content="#111827">
+    <style>
+      :root{color-scheme:dark light}
+      body{font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial,Apple Color Emoji,Segoe UI Emoji; 
+           background:#0b1020; color:#f8fafc; margin:0; padding:0}
+      .container{max-width:1000px;margin:0 auto;padding:24px}
+      .card{background:#101935;border:1px solid #1e2a55;border-radius:16px;padding:20px;box-shadow:0 10px 25px rgba(0,0,0,.25)}
+      .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+      button{background:#334155;border:none;border-radius:10px;color:#fff;padding:10px 14px;cursor:pointer}
+      button.primary{background:#2563eb}
+      button:disabled{opacity:.5;cursor:not-allowed}
+      input[type=text], input[type=number]{padding:8px 10px;border-radius:10px;border:1px solid #314061;background:#0f172a;color:#e2e8f0}
+      select{padding:8px 10px;border-radius:10px;border:1px solid #314061;background:#0f172a;color:#e2e8f0}
+      .pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#0f172a;border:1px solid #1f2b55}
+      .grid{display:grid;grid-template-columns:1fr 1fr; gap:16px}
+      .metric{font-size:40px; font-weight:800}
+      .metric-sm{font-size:24px; font-weight:700}
+      .sub{opacity:.75;font-size:12px}
+      .footer{opacity:.6;font-size:12px;margin-top:24px;text-align:center}
+      .error{background:#7f1d1d;border:1px solid #b91c1c;color:#fecaca;padding:8px 10px;border-radius:10px}
+      .small{font-size:12px;opacity:.8}
+      .section{margin-top:16px}
+      .kbd{background:#0f172a;border:1px solid #1f2b55;border-radius:6px;padding:2px 6px;font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace}
+      .ok{color:#86efac}
+      .warn{color:#fde68a}
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
