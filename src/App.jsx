@@ -80,6 +80,8 @@ export default function App(){
   const [elapsed,setElapsed]=useState(0)
   const [extractionInfo,setExtractionInfo]=useState({active:false,duration:0,lastDuration:0})
 
+  const scaleRef=useRef(scale)
+  const zeroRawRef=useRef(zeroRaw)
   const charRef=useRef(null)
   const deviceRef=useRef(null)
   const notifyHandlerRef=useRef(null)
@@ -92,6 +94,9 @@ export default function App(){
   const chartRef=useRef(null)
 
   useEffect(()=>{ runningRef.current=running },[running])
+
+  useEffect(()=>{ scaleRef.current=scale },[scale])
+  useEffect(()=>{ zeroRawRef.current=zeroRaw },[zeroRaw])
 
   useEffect(()=>{
     const storedScale=JSON.parse(localStorage.getItem(`mentor.${currentProfile}.scale`)||'0.001')
@@ -328,8 +333,10 @@ export default function App(){
       const raw=decodeRawMg(dv)
       const now=performance.now()
 
-      const abs=raw*scale
-      const net=(raw-zeroRaw)*scale
+      const scaleValue=scaleRef.current || scale
+      const zeroValue=zeroRawRef.current || zeroRaw
+      const abs=raw*scaleValue
+      const net=(raw-zeroValue)*scaleValue
 
       if(smoothRef.current.skipUntil && now < smoothRef.current.skipUntil){
         return
@@ -459,18 +466,26 @@ export default function App(){
   }
 
   function applyTare(){
-    const rawEst=Math.round(absG/scale)
+    const scaleValue=scaleRef.current || scale
+    const rawEst=scaleValue ? Math.round(absG/scaleValue) : 0
     setZeroRaw(rawEst)
+    zeroRawRef.current=rawEst
     setTareApplied(true)
     setTareValueG(absG)
     setTareTime(new Date().toISOString())
+    smoothRef.current.net=[]
+    smoothRef.current.abs=[]
+    setNetG(0)
+    setFlowGps(0)
     extractionRef.current={ baseline:0, hasBaseline:true, active:false, start:0, lastRiseTime:performance.now(), lastRiseWeight:0 }
     flowRef.current={time:null,net:0}
   }
 
   function spanCal(knownG){
-    const rawEst=Math.round(absG/scale)
-    const delta=rawEst - zeroRaw
+    const scaleValue=scaleRef.current || scale
+    const zeroValue=zeroRawRef.current || zeroRaw
+    const rawEst=scaleValue ? Math.round(absG/scaleValue) : 0
+    const delta=rawEst - zeroValue
     if(Math.abs(delta)<1){ alert('Coloca un peso de referencia y vuelve a intentar.'); return }
     const newScale = knownG / delta
     setScale(newScale)
