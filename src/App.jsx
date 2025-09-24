@@ -9,6 +9,42 @@ const DEFAULT_CHAR = '1bc50002-0200-0aa5-e311-24cb004a98c5'
 
 function decodeRawMg(dv){ return dv.getInt32(0,true) }
 
+const FLOW_OPTIMAL_MIN = 1.5
+const FLOW_OPTIMAL_MAX = 3.5
+
+const clamp=(value,min,max)=>Math.min(max,Math.max(min,value))
+
+function median(values){
+  if(!values.length) return 0
+  const sorted=[...values].sort((a,b)=>a-b)
+  const mid=Math.floor(sorted.length/2)
+  return sorted.length%2? sorted[mid] : (sorted[mid-1]+sorted[mid])/2
+}
+
+function mad(values, med){
+  if(!values.length) return 0
+  const diffs=values.map(v=>Math.abs(v-(med??median(values))))
+  return median(diffs)
+}
+
+function correlation(xs, ys){
+  const n=Math.min(xs.length, ys.length)
+  if(n<2) return 0
+  let sumX=0,sumY=0
+  for(let i=0;i<n;i++){ sumX+=xs[i]; sumY+=ys[i] }
+  const meanX=sumX/n, meanY=sumY/n
+  let cov=0, varX=0, varY=0
+  for(let i=0;i<n;i++){
+    const dx=xs[i]-meanX
+    const dy=ys[i]-meanY
+    cov+=dx*dy
+    varX+=dx*dx
+    varY+=dy*dy
+  }
+  const denom=Math.sqrt(varX*varY)
+  return denom? clamp(cov/denom, -1, 1) : 0
+}
+
 function useLocalStorage(key, initial) {
   const [state, setState] = useState(() => {
     try {
@@ -53,6 +89,160 @@ export default function App(){
   const smoothRef=useRef({ net:[], abs:[], durationMs:300, skipUntil:0 })
   const extractionRef=useRef({ baseline:0, hasBaseline:false, active:false, start:0, lastRiseTime:0, lastRiseWeight:0 })
   const chartRef=useRef(null)
+
+  const analysis=useMemo(()=>{
+    if(samples.length<3){
+      return {
+        preinfusionDuration:0,
+        avgFlow:0,
+        peakFlow:0,
+        hydraulicScore:0,
+        hydraulicSummary:'Sin datos suficientes para analizar la relación resistencia-flujo.',
+        flowCorrelation:0,
+        channelingIndex:0,
+        channelingSpikes:0,
+        channelingSummary:'',
+        maxAccel:0,
+        flowDistribution:{optimal:0,low:0,high:0},
+        flowDistributionSummary:'',
+        rampTime:0,
+        finalFlow:0,
+        minFlow:0,
+        rampSlope:0
+      }
+    }
+
+    const flows=samples.map(s=>s.flow)
+    const weights=samples.map(s=>s.g)
+    const times=samples.map(s=>s.t)
+
+    const firstTime=times[0]
+    const totalDuration=times[times.length-1]-firstTime
+
+    let preIndex=0
+    for(let i=0;i<flows.length;i++){
+      if(flows[i]>0.5){
+        const window=samples.slice(i, Math.min(i+5, samples.length))
+        const avgWindow=window.reduce((acc,cur)=>acc+cur.flow,0)/window.length
+        if(avgWindow>0.5){ preIndex=i; break }
+      }
+    }
+
+    const preinfusionDuration=times[Math.max(preIndex,0)]-firstTime
+    const activeSamples=samples.slice(preIndex)
+    if(activeSamples.length<2){
+      return {
+        preinfusionDuration:Math.max(0, preinfusionDuration),
+        avgFlow:0,
+        peakFlow:0,
+        hydraulicScore:0,
+        hydraulicSummary:'Sin datos suficientes después de la preinfusión.',
+        flowCorrelation:0,
+        channelingIndex:0,
+        channelingSpikes:0,
+        channelingSummary:'',
+        maxAccel:0,
+        flowDistribution:{optimal:0,low:0,high:0},
+        flowDistributionSummary:'',
+        rampTime:0,
+        finalFlow:0,
+        minFlow:0,
+        rampSlope:0
+      }
+    }
+
+    const activeFlows=activeSamples.map(s=>s.flow)
+    const activeWeights=activeSamples.map(s=>s.g)
+    const activeTimes=activeSamples.map(s=>s.t)
+    const activeDuration=activeTimes[activeTimes.length-1]-activeTimes[0]
+
+    const avgFlow=activeFlows.reduce((acc,v)=>acc+v,0)/activeFlows.length
+    const peakFlow=Math.max(...activeFlows.map(v=>isFinite(v)?v:0))
+    const minFlow=Math.min(...activeFlows.map(v=>isFinite(v)?v:0))
+
+    const rampWindowEnd=activeTimes[0]+Math.min(4, Math.max(1, activeDuration))
+    const rampSlice=activeSamples.filter(s=>s.t<=rampWindowEnd)
+    const rampSlope=rampSlice.length>1 ? (rampSlice[rampSlice.length-1].flow - rampSlice[0].flow)/Math.max(0.25, rampSlice[rampSlice.length-1].t-rampSlice[0].t) : 0
+
+    const finalWindowStart=activeTimes[activeTimes.length-1]-Math.min(1.5, Math.max(0.5, activeDuration/3))
+    const finalSlice=activeSamples.filter(s=>s.t>=finalWindowStart)
+    const finalFlow=finalSlice.length? finalSlice.reduce((acc,s)=>acc+s.flow,0)/finalSlice.length : activeFlows[activeFlows.length-1]
+
+    const hydraulicRatio=peakFlow? avgFlow/peakFlow : 0
+    const hydraulicScore=Math.round(clamp((1-hydraulicRatio)*100,0,100))
+    const correlationFlowWeight=correlation(activeWeights, activeFlows)
+
+    let hydraulicSummary
+    if(hydraulicScore>70){ hydraulicSummary='Resistencia muy alta: el flujo promedio es muy inferior al pico medido.' }
+    else if(hydraulicScore>45){ hydraulicSummary='Resistencia elevada: el flujo tarda en abrirse, revisa molienda y distribución.' }
+    else if(hydraulicScore>25){ hydraulicSummary='Resistencia moderada: la rampa de flujo es suave y consistente.' }
+    else { hydraulicSummary='Resistencia baja: el flujo es ágil; vigila que no se sobre-extraiga.' }
+    hydraulicSummary+=` Correlación flujo-peso: ${correlationFlowWeight.toFixed(2)}.`
+
+    const flowMedian=median(activeFlows)
+    const flowMad=mad(activeFlows, flowMedian)
+    let spikeCount=0
+    let maxAccel=0
+    for(let i=1;i<activeSamples.length;i++){
+      const dt=Math.max(0.05, activeSamples[i].t-activeSamples[i-1].t)
+      const accel=(activeSamples[i].flow-activeSamples[i-1].flow)/dt
+      if(Math.abs(accel)>maxAccel) maxAccel=Math.abs(accel)
+      if(activeSamples[i].flow>flowMedian+2*(flowMad||0.1) && accel>0.6){ spikeCount++ }
+    }
+    const channelingIndex=Math.round(clamp((spikeCount/Math.max(1, activeSamples.length-1))*400,0,100))
+    let channelingSummary
+    if(channelingIndex>60){ channelingSummary='Canalización crítica: múltiples picos de flujo acelerados.' }
+    else if(channelingIndex>35){ channelingSummary='Canalización moderada: detectadas aceleraciones puntuales.' }
+    else if(channelingIndex>10){ channelingSummary='Canalización leve: el flujo presenta pequeñas irregularidades.' }
+    else { channelingSummary='Canalización mínima: la curva es uniforme.' }
+
+    let timeOptimal=0, timeLow=0, timeHigh=0
+    for(let i=1;i<activeSamples.length;i++){
+      const dt=Math.max(0, activeSamples[i].t-activeSamples[i-1].t)
+      const flow=activeSamples[i].flow
+      if(flow<FLOW_OPTIMAL_MIN){ timeLow+=dt }
+      else if(flow>FLOW_OPTIMAL_MAX){ timeHigh+=dt }
+      else { timeOptimal+=dt }
+    }
+    const timeTotal=timeOptimal+timeLow+timeHigh || activeDuration || totalDuration || 1
+    const flowDistribution={
+      optimal: clamp((timeOptimal/timeTotal)*100,0,100),
+      low: clamp((timeLow/timeTotal)*100,0,100),
+      high: clamp((timeHigh/timeTotal)*100,0,100)
+    }
+
+    let flowDistributionSummary
+    if(flowDistribution.optimal>60){ flowDistributionSummary='Mayor parte de la extracción dentro del rango clásico de espresso.' }
+    else if(flowDistribution.low>flowDistribution.high){ flowDistributionSummary='Predomina flujo bajo: posible sobre-resistencia o sub-extracción.' }
+    else { flowDistributionSummary='Predomina flujo alto: revisa molienda o ratio para evitar canalización.' }
+
+    const targetPeak=peakFlow||finalFlow||avgFlow
+    let rampTime=0
+    if(targetPeak>0){
+      for(let i=0;i<activeSamples.length;i++){
+        if(activeSamples[i].flow>=0.9*targetPeak){ rampTime=activeSamples[i].t-activeTimes[0]; break }
+      }
+    }
+
+    return {
+      preinfusionDuration:Math.max(0, preinfusionDuration),
+      avgFlow:isFinite(avgFlow)?avgFlow:0,
+      peakFlow:isFinite(peakFlow)?peakFlow:0,
+      hydraulicScore,
+      hydraulicSummary,
+      flowCorrelation:correlationFlowWeight,
+      channelingIndex,
+      channelingSpikes:spikeCount,
+      channelingSummary,
+      maxAccel:isFinite(maxAccel)?maxAccel:0,
+      flowDistribution,
+      flowDistributionSummary,
+      rampTime:Math.max(0,rampTime),
+      finalFlow:isFinite(finalFlow)?finalFlow:0,
+      minFlow:isFinite(minFlow)?minFlow:0,
+      rampSlope:isFinite(rampSlope)?rampSlope:0
+    }
+  },[samples])
 
   useEffect(()=>{
     // When profile changes, rebind scale/zero from localStorage
@@ -417,6 +607,32 @@ export default function App(){
         <div className="sub">Timer total</div>
         <div className="metric-sm">{formatTime(elapsed)}</div>
         <div className="sub">Extraction time: <span className="kbd">{extractionInfo.active ? formatTime(extractionInfo.duration,1) : extractionInfo.lastDuration ? formatTime(extractionInfo.lastDuration,1) : '—'}</span> {extractionInfo.active ? <span className="ok">en curso</span> : extractionInfo.lastDuration ? <span className="ok">última</span> : <span className="warn">pendiente</span>}</div>
+      </div>
+    </div>
+
+    <div className="section card">
+      <h3 style={{marginTop:0}}>Panel de resultados</h3>
+      <div className="grid" style={{marginTop:12}}>
+        <div className="card" style={{padding:'16px'}}>
+          <div className="sub">Relación resistencia-flujo</div>
+          <div className="metric-sm">{analysis.hydraulicScore.toFixed(0)} <span className="sub">índice</span></div>
+          <div className="small">Promedio: {analysis.avgFlow.toFixed(2)} g/s • Pico: {analysis.peakFlow.toFixed(2)} g/s • Final: {analysis.finalFlow.toFixed(2)} g/s</div>
+          <div className="small">Rampa inicial: {analysis.rampSlope.toFixed(2)} g/s² • Tiempo a 90% pico: {analysis.rampTime>0?`${analysis.rampTime.toFixed(1)} s`:'—'}</div>
+          <div className="small">{analysis.hydraulicSummary}</div>
+        </div>
+        <div className="card" style={{padding:'16px'}}>
+          <div className="sub">Índice de canalización</div>
+          <div className="metric-sm">{analysis.channelingIndex.toFixed(0)} <span className="sub">/100</span></div>
+          <div className="small">Picos detectados: {analysis.channelingSpikes} • Máx aceleración: {analysis.maxAccel.toFixed(2)} g/s²</div>
+          <div className="small">{analysis.channelingSummary}</div>
+        </div>
+        <div className="card" style={{padding:'16px'}}>
+          <div className="sub">Distribución del flujo</div>
+          <div className="small">Preinfusión: {analysis.preinfusionDuration>0?`${analysis.preinfusionDuration.toFixed(1)} s`:'—'} • Flujo mínimo: {analysis.minFlow.toFixed(2)} g/s</div>
+          <div className="small">En rango ({FLOW_OPTIMAL_MIN}-{FLOW_OPTIMAL_MAX} g/s): {analysis.flowDistribution.optimal.toFixed(0)}%</div>
+          <div className="small">Bajo rango: {analysis.flowDistribution.low.toFixed(0)}% • Alto rango: {analysis.flowDistribution.high.toFixed(0)}%</div>
+          <div className="small">{analysis.flowDistributionSummary}</div>
+        </div>
       </div>
     </div>
 
