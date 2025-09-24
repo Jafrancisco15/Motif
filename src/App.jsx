@@ -89,6 +89,14 @@ export default function App(){
   const lastCapturedRef=useRef(null)
   const flowRef=useRef({time:null,net:0})
   const smoothRef=useRef({ net:[], abs:[], durationMs:300, skipUntil:0 })
+  const stabilityRef=useRef({
+    net:[],
+    abs:[],
+    holdNet:null,
+    holdAbs:null,
+    durationMs:1800,
+    releaseThreshold:0.15
+  })
   const extractionRef=useRef({ baseline:0, hasBaseline:false, active:false, start:0, lastRiseTime:0, lastRiseWeight:0 })
   const runningRef=useRef(false)
   const chartRef=useRef(null)
@@ -97,6 +105,49 @@ export default function App(){
 
   useEffect(()=>{ scaleRef.current=scale },[scale])
   useEffect(()=>{ zeroRawRef.current=zeroRaw },[zeroRaw])
+
+  function resetFilters(){
+    smoothRef.current.net=[]
+    smoothRef.current.abs=[]
+    smoothRef.current.skipUntil=0
+    const state=stabilityRef.current
+    state.net=[]
+    state.abs=[]
+    state.holdNet=null
+    state.holdAbs=null
+  }
+
+  function stabilizeValue(channel, value, now){
+    const state=stabilityRef.current
+    const buffer=channel==='net'?state.net:state.abs
+    const holdKey=channel==='net'?'holdNet':'holdAbs'
+    buffer.push({t:now,value})
+    const cutoff=now-state.durationMs
+    while(buffer.length && buffer[0].t<cutoff){ buffer.shift() }
+    if(buffer.length){
+      let min=buffer[0].value
+      let max=buffer[0].value
+      const values=buffer.map(item=>{
+        if(item.value<min){ min=item.value }
+        if(item.value>max){ max=item.value }
+        return item.value
+      })
+      const med=median(values)
+      const deviation=mad(values, med)
+      const range=max-min
+      if(values.length>=6 && deviation<=0.003 && range<=0.03 && Math.abs(value-med)<=0.05){
+        state[holdKey]=med
+      }else if(state[holdKey]!==null){
+        if(Math.abs(value-state[holdKey])>state.releaseThreshold || range>0.08){
+          state[holdKey]=null
+        }
+      }
+      if(state[holdKey]!==null){
+        return state[holdKey]
+      }
+    }
+    return value
+  }
 
   useEffect(()=>{
     const storedScale=JSON.parse(localStorage.getItem(`mentor.${currentProfile}.scale`)||'0.001')
@@ -276,6 +327,7 @@ export default function App(){
 
   function resetRunState(){
     const now=performance.now()
+    resetFilters()
     startTimeRef.current=now
     lastCapturedRef.current=null
     setSamples([])
@@ -313,6 +365,7 @@ export default function App(){
     setConnected(false)
     setConnecting(false)
     setDeviceName('')
+    resetFilters()
     setSamples([])
     setFlowGps(0)
     setElapsed(0)
@@ -352,7 +405,6 @@ export default function App(){
       const smoothedAbs=avg(smoothRef.current.abs)
 
       const prevFlow=flowRef.current
-      let instantaneousFlow=0
       if(prevFlow.time!==null){
         const dt=Math.max(1e-3, (now-prevFlow.time)/1000)
         const diff=smoothedNet-prevFlow.net
@@ -361,13 +413,21 @@ export default function App(){
           smoothRef.current.skipUntil=now+600
           return
         }
-        instantaneousFlow=inst
       }
       smoothRef.current.skipUntil=0
 
-      setAbsG(smoothedAbs)
-      setNetG(smoothedNet)
-      flowRef.current={time:now,net:smoothedNet}
+      const stableNet=stabilizeValue('net', smoothedNet, now)
+      const stableAbs=stabilizeValue('abs', smoothedAbs, now)
+
+      let instantaneousFlow=0
+      if(prevFlow.time!==null){
+        const dt=Math.max(1e-3, (now-prevFlow.time)/1000)
+        instantaneousFlow=(stableNet-prevFlow.net)/dt
+      }
+
+      setAbsG(stableAbs)
+      setNetG(stableNet)
+      flowRef.current={time:now,net:stableNet}
       setFlowGps(Number(instantaneousFlow.toFixed(3)))
 
       if(runningRef.current && startTimeRef.current){
@@ -376,10 +436,10 @@ export default function App(){
         let flow=instantaneousFlow
         if(lastCaptured){
           const dt=Math.max(1e-3, t-lastCaptured.t)
-          flow=(smoothedNet-lastCaptured.g)/dt
+          flow=(stableNet-lastCaptured.g)/dt
         }
         const roundedFlow=Number(flow.toFixed(3))
-        const newSample={t, g: smoothedNet, flow: roundedFlow}
+        const newSample={t, g: stableNet, flow: roundedFlow}
         lastCapturedRef.current=newSample
         setSamples(prev=>{
           const next=[...prev, newSample]
@@ -473,8 +533,7 @@ export default function App(){
     setTareApplied(true)
     setTareValueG(absG)
     setTareTime(new Date().toISOString())
-    smoothRef.current.net=[]
-    smoothRef.current.abs=[]
+    resetFilters()
     setNetG(0)
     setFlowGps(0)
     extractionRef.current={ baseline:0, hasBaseline:true, active:false, start:0, lastRiseTime:performance.now(), lastRiseWeight:0 }
