@@ -11,15 +11,36 @@ const DEFAULT_CHAR = '1bc50002-0200-0aa5-e311-24cb004a98c5'
 const FLOW_OPTIMAL_MIN = 1.5
 const FLOW_OPTIMAL_MAX = 3.5
 const PREINFUSION_THRESHOLD = 0.5
-const RAO_FLOW_START = 0.75
-const RAO_FLOW_END = 1.75
+
+const RECOMMENDED_FLOW_ZONE = [
+  { progress: 0, min: 0, max: 0 },
+  { progress: 0.12, min: 0.25, max: 0.75 },
+  { progress: 0.25, min: 0.8, max: 1.6 },
+  { progress: 0.45, min: 1.25, max: 2.1 },
+  { progress: 0.65, min: 1.45, max: 2.35 },
+  { progress: 0.8, min: 1.45, max: 2.4 },
+  { progress: 0.92, min: 1.3, max: 2.2 },
+  { progress: 1, min: 1.1, max: 2.0 }
+]
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
-const easeInOutCubic = (t) => {
-  const clamped = clamp(t, 0, 1)
-  return clamped < 0.5
-    ? 4 * clamped * clamped * clamped
-    : 1 - Math.pow(-2 * clamped + 2, 3) / 2
+
+const interpolateZone = (progress) => {
+  if(!Number.isFinite(progress)) return RECOMMENDED_FLOW_ZONE[0]
+  const clamped = clamp(progress, 0, 1)
+  for(let i=0;i<RECOMMENDED_FLOW_ZONE.length-1;i++){
+    const current = RECOMMENDED_FLOW_ZONE[i]
+    const next = RECOMMENDED_FLOW_ZONE[i+1]
+    if(clamped <= next.progress){
+      const span = clamp((clamped - current.progress) / Math.max(1e-6, next.progress - current.progress), 0, 1)
+      return {
+        min: current.min + (next.min - current.min) * span,
+        max: current.max + (next.max - current.max) * span
+      }
+    }
+  }
+  const last = RECOMMENDED_FLOW_ZONE[RECOMMENDED_FLOW_ZONE.length-1]
+  return { min: last.min, max: last.max }
 }
 
 function median(values){
@@ -187,11 +208,11 @@ export default function App(){
         minFlow:0,
         rampSlope:0,
         preinfusionIndex:0,
-        raoCurve:[],
-        raoDeviation:0,
-        raoMeanDeviation:0,
-        raoMaxDeviation:0,
-        raoSummary:''
+        zoneGuide:[],
+        zoneCoverage:{inside:0,below:0,above:0},
+        zoneAverageGap:0,
+        zoneMaxGap:0,
+        zoneSummary:''
       }
     }
 
@@ -232,11 +253,11 @@ export default function App(){
         minFlow:0,
         rampSlope:0,
         preinfusionIndex:preIndex,
-        raoCurve:[],
-        raoDeviation:0,
-        raoMeanDeviation:0,
-        raoMaxDeviation:0,
-        raoSummary:''
+        zoneGuide:[],
+        zoneCoverage:{inside:0,below:0,above:0},
+        zoneAverageGap:0,
+        zoneMaxGap:0,
+        zoneSummary:''
       }
     }
 
@@ -315,43 +336,53 @@ export default function App(){
       }
     }
 
-    const raoCurve=activeSamples.map(sample=>{
-      const normalized=activeDuration>0 ? (sample.t-activeTimes[0]) / Math.max(activeDuration, 1e-6) : 0
-      const target=RAO_FLOW_START + (RAO_FLOW_END-RAO_FLOW_START) * easeInOutCubic(normalized)
-      return { t: sample.t, target }
-    })
-    let sumSq=0
-    let sumAbs=0
-    let maxDiff=0
-    let startDiff=0
-    let endDiff=0
-    if(raoCurve.length){
-      startDiff=activeSamples[0].flow - raoCurve[0].target
-      endDiff=activeSamples[raoCurve.length-1].flow - raoCurve[raoCurve.length-1].target
+    const zoneGuide=[]
+    let zoneInside=0
+    let zoneBelow=0
+    let zoneAbove=0
+    let zoneGapWeighted=0
+    let zoneMaxGap=0
+    for(let i=0;i<activeSamples.length;i++){
+      const progress = activeDuration>0 ? (activeSamples[i].t-activeTimes[0]) / Math.max(activeDuration, 1e-6) : 0
+      const zone=interpolateZone(progress)
+      zoneGuide.push({ t: activeSamples[i].t, min: zone.min, max: zone.max })
+      if(i===0) continue
+      const dt=Math.max(0, activeSamples[i].t-activeSamples[i-1].t)
+      const flow=activeSamples[i].flow
+      if(flow<zone.min){
+        zoneBelow+=dt
+        const gap=zone.min-flow
+        zoneGapWeighted+=gap*dt
+        if(gap>zoneMaxGap){ zoneMaxGap=gap }
+      }else if(flow>zone.max){
+        zoneAbove+=dt
+        const gap=flow-zone.max
+        zoneGapWeighted+=gap*dt
+        if(gap>zoneMaxGap){ zoneMaxGap=gap }
+      }else{
+        zoneInside+=dt
+      }
     }
-    raoCurve.forEach((point, idx)=>{
-      const diff=activeSamples[idx].flow - point.target
-      if(!isFinite(diff)) return
-      sumSq+=diff*diff
-      sumAbs+=Math.abs(diff)
-      if(Math.abs(diff)>maxDiff){ maxDiff=Math.abs(diff) }
-    })
-    const raoDeviation = raoCurve.length ? Math.sqrt(sumSq/raoCurve.length) : 0
-    const raoMeanDeviation = raoCurve.length ? sumAbs/raoCurve.length : 0
-
-    let raoSummary
-    if(raoDeviation<0.2){
-      raoSummary='Curva muy alineada con la referencia de Scott Rao.'
-    }else if(raoDeviation<0.35){
-      raoSummary='Curva razonablemente cercana a la referencia de Scott Rao.'
+    const zoneTotal=Math.max(zoneInside+zoneBelow+zoneAbove, activeDuration, 1e-6)
+    const zoneCoverage={
+      inside:clamp((zoneInside/zoneTotal)*100,0,100),
+      below:clamp((zoneBelow/zoneTotal)*100,0,100),
+      above:clamp((zoneAbove/zoneTotal)*100,0,100)
+    }
+    const zoneAverageGap=zoneGapWeighted/zoneTotal
+    let zoneSummary
+    if(zoneCoverage.inside>65){
+      zoneSummary='Extracción alineada con la zona recomendada durante la mayor parte del tiro.'
+    }else if(zoneCoverage.above>zoneCoverage.below){
+      zoneSummary='Predominan caudales por encima de la zona; riesgo de sub-extracción o canalización.'
+    }else if(zoneCoverage.below>zoneCoverage.above){
+      zoneSummary='Predominan caudales por debajo de la zona; posible sobre-extracción por resistencia alta.'
     }else{
-      raoSummary='Curva alejada de la referencia de Scott Rao; revisa molienda y distribución.'
+      zoneSummary='Flujo alternando entre los límites recomendados; ajusta distribución y molienda.'
     }
-    const trendNotes=[]
-    if(Math.abs(startDiff)>0.3){ trendNotes.push(startDiff>0?'Inicia con más caudal que la referencia.':'Inicia más lenta que la referencia.') }
-    if(Math.abs(endDiff)>0.3){ trendNotes.push(endDiff>0?'Finaliza con más caudal del esperado.':'Finaliza por debajo del flujo objetivo.') }
-    if(!trendNotes.length && raoCurve.length){ trendNotes.push('Inicio y cierre muy cercanos a la guía propuesta.') }
-    raoSummary+=` ${trendNotes.join(' ')}`
+    if(zoneMaxGap>0.35){
+      zoneSummary+=` Picos fuera de zona de hasta ${zoneMaxGap.toFixed(2)} g/s.`
+    }
 
     return {
       preinfusionDuration:Math.max(0, preinfusionDuration),
@@ -371,11 +402,11 @@ export default function App(){
       minFlow:isFinite(minFlow)?minFlow:0,
       rampSlope:isFinite(rampSlope)?rampSlope:0,
       preinfusionIndex:preIndex,
-      raoCurve,
-      raoDeviation:isFinite(raoDeviation)?raoDeviation:0,
-      raoMeanDeviation:isFinite(raoMeanDeviation)?raoMeanDeviation:0,
-      raoMaxDeviation:isFinite(maxDiff)?maxDiff:0,
-      raoSummary
+      zoneGuide,
+      zoneCoverage,
+      zoneAverageGap:isFinite(zoneAverageGap)?zoneAverageGap:0,
+      zoneMaxGap:isFinite(zoneMaxGap)?zoneMaxGap:0,
+      zoneSummary
     }
   },[samples])
 
@@ -657,16 +688,26 @@ export default function App(){
     const safeMaxLine=samples.map(()=>FLOW_OPTIMAL_MAX)
     const preinfusionLine=samples.map(()=>PREINFUSION_THRESHOLD)
     const preIndex=analysis.preinfusionIndex||0
-    const raoCurve=analysis.raoCurve||[]
-    const raoLine=samples.map((_,idx)=>{
-      if(idx<preIndex){ return RAO_FLOW_START }
-      const curvePoint=raoCurve[idx-preIndex]
-      if(curvePoint && isFinite(curvePoint.target)){ return Number(curvePoint.target.toFixed(3)) }
-      if(raoCurve.length){
-        const last=raoCurve[raoCurve.length-1]
-        return isFinite(last.target)?Number(last.target.toFixed(3)):RAO_FLOW_END
+    const zoneGuide=analysis.zoneGuide||[]
+    const zoneMaxLine=samples.map((_,idx)=>{
+      if(idx<preIndex){ return PREINFUSION_THRESHOLD }
+      const guide=zoneGuide[idx-preIndex]
+      if(guide && isFinite(guide.max)){ return Number(guide.max.toFixed(3)) }
+      if(zoneGuide.length){
+        const last=zoneGuide[zoneGuide.length-1]
+        if(isFinite(last.max)){ return Number(last.max.toFixed(3)) }
       }
-      return RAO_FLOW_START
+      return PREINFUSION_THRESHOLD
+    })
+    const zoneMinLine=samples.map((_,idx)=>{
+      if(idx<preIndex){ return 0 }
+      const guide=zoneGuide[idx-preIndex]
+      if(guide && isFinite(guide.min)){ return Number(guide.min.toFixed(3)) }
+      if(zoneGuide.length){
+        const last=zoneGuide[zoneGuide.length-1]
+        if(isFinite(last.min)){ return Number(last.min.toFixed(3)) }
+      }
+      return 0
     })
     return {
       labels,
@@ -692,13 +733,25 @@ export default function App(){
           pointRadius:0,
         },
         {
-          label:'Referencia Rao (g/s)',
+          label:'Zona recomendada (máximo)',
           yAxisID:'y1',
-          data:raoLine,
+          data:zoneMaxLine,
           fill:false,
-          borderColor:'rgba(56,189,248,0.9)',
-          borderDash:[6,3],
+          borderColor:'rgba(59,130,246,0.9)',
+          borderWidth:1.5,
           pointRadius:0,
+          tension:0.2
+        },
+        {
+          label:'Zona recomendada (mínimo)',
+          yAxisID:'y1',
+          data:zoneMinLine,
+          borderColor:'rgba(245,158,11,0.95)',
+          borderWidth:1.2,
+          pointRadius:0,
+          tension:0.2,
+          fill:'-1',
+          backgroundColor:'rgba(250,204,21,0.18)'
         },
         {
           label:`Límite seguro mínimo (${FLOW_OPTIMAL_MIN} g/s)`,
@@ -797,15 +850,15 @@ export default function App(){
         minFlow:analysis.minFlow,
         safeFlowRange:[FLOW_OPTIMAL_MIN,FLOW_OPTIMAL_MAX],
         preinfusionThreshold:PREINFUSION_THRESHOLD,
-        raoDeviationRMS:analysis.raoDeviation,
-        raoMeanDeviation:analysis.raoMeanDeviation,
-        raoMaxDeviation:analysis.raoMaxDeviation
+        zoneCoverage:analysis.zoneCoverage,
+        zoneAverageGap:analysis.zoneAverageGap,
+        zoneMaxGap:analysis.zoneMaxGap
       },
       narratives:{
         hydraulic:analysis.hydraulicSummary,
         channeling:analysis.channelingSummary,
         distribution:analysis.flowDistributionSummary,
-        rao:analysis.raoSummary
+        zone:analysis.zoneSummary
       }
     }
     const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'})
@@ -926,10 +979,11 @@ export default function App(){
               <div className="small">{analysis.flowDistributionSummary}</div>
             </div>
             <div className="card" style={{padding:'16px'}}>
-              <div className="sub">Referencia Scott Rao</div>
-              <div className="metric-sm">{analysis.raoDeviation.toFixed(2)} <span className="sub">RMS g/s</span></div>
-              <div className="small">Desviación media: {analysis.raoMeanDeviation.toFixed(2)} g/s • Máx diferencia: {analysis.raoMaxDeviation.toFixed(2)} g/s</div>
-              <div className="small">{analysis.raoSummary}</div>
+              <div className="sub">Zona recomendada de caudal</div>
+              <div className="metric-sm">{analysis.zoneCoverage.inside.toFixed(0)} <span className="sub">% en zona</span></div>
+              <div className="small">Debajo: {analysis.zoneCoverage.below.toFixed(0)}% • Encima: {analysis.zoneCoverage.above.toFixed(0)}%</div>
+              <div className="small">Brecha media: {analysis.zoneAverageGap.toFixed(2)} g/s • Máx brecha: {analysis.zoneMaxGap.toFixed(2)} g/s</div>
+              <div className="small">{analysis.zoneSummary}</div>
             </div>
           </div>
         </div>
