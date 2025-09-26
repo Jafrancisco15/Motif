@@ -12,35 +12,64 @@ const FLOW_OPTIMAL_MIN = 1.5
 const FLOW_OPTIMAL_MAX = 3.5
 const PREINFUSION_THRESHOLD = 0.5
 
-const RECOMMENDED_FLOW_ZONE = [
-  { progress: 0, min: 0, max: 0 },
-  { progress: 0.12, min: 0.25, max: 0.75 },
-  { progress: 0.25, min: 0.8, max: 1.6 },
-  { progress: 0.45, min: 1.25, max: 2.1 },
-  { progress: 0.65, min: 1.45, max: 2.35 },
-  { progress: 0.8, min: 1.45, max: 2.4 },
-  { progress: 0.92, min: 1.3, max: 2.2 },
-  { progress: 1, min: 1.1, max: 2.0 }
-]
+const FLOW_ZONE_PRESETS = {
+  SINPF: {
+    id: 'SINPF',
+    label: 'Zona segura sin preinfusión',
+    shortLabel: 'sin preinfusión',
+    optionLabel: 'SIN preinfusión (SINPF)',
+    description: 'Envelope recomendado para extracciones directas sin etapa de preinfusión prolongada.',
+    nodes: [
+      { progress: 0, min: 0, max: 0 },
+      { progress: 0.17, min: 0.6, max: 3.0 },
+      { progress: 0.33, min: 1.4, max: 3.4 },
+      { progress: 0.5, min: 1.3, max: 3.1 },
+      { progress: 0.67, min: 1.2, max: 2.7 },
+      { progress: 1, min: 0.9, max: 2.1 }
+    ]
+  },
+  CONPF: {
+    id: 'CONPF',
+    label: 'Zona segura con preinfusión',
+    shortLabel: 'con preinfusión',
+    optionLabel: 'CON preinfusión (CONPF)',
+    description: 'Envelope recomendado cuando se aplica preinfusión antes del flujo principal.',
+    nodes: [
+      { progress: 0, min: 0, max: 0 },
+      { progress: 0.17, min: 0.3, max: 1.2 },
+      { progress: 0.33, min: 0.8, max: 2.1 },
+      { progress: 0.5, min: 1.0, max: 2.3 },
+      { progress: 0.67, min: 1.1, max: 2.2 },
+      { progress: 1, min: 1.0, max: 2.0 }
+    ]
+  }
+}
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
 
-const interpolateZone = (progress) => {
-  if(!Number.isFinite(progress)) return RECOMMENDED_FLOW_ZONE[0]
+const interpolateZone = (nodes, progress) => {
+  if(!nodes || !nodes.length){
+    return { min: 0, max: 0 }
+  }
+  if(!Number.isFinite(progress)){
+    const first = nodes[0]
+    return { min: first.min ?? 0, max: first.max ?? 0 }
+  }
   const clamped = clamp(progress, 0, 1)
-  for(let i=0;i<RECOMMENDED_FLOW_ZONE.length-1;i++){
-    const current = RECOMMENDED_FLOW_ZONE[i]
-    const next = RECOMMENDED_FLOW_ZONE[i+1]
+  for(let i=0;i<nodes.length-1;i++){
+    const current = nodes[i]
+    const next = nodes[i+1]
     if(clamped <= next.progress){
-      const span = clamp((clamped - current.progress) / Math.max(1e-6, next.progress - current.progress), 0, 1)
+      const denom = Math.max(1e-6, next.progress - current.progress)
+      const span = clamp((clamped - current.progress) / denom, 0, 1)
       return {
-        min: current.min + (next.min - current.min) * span,
-        max: current.max + (next.max - current.max) * span
+        min: (current.min ?? 0) + ((next.min ?? 0) - (current.min ?? 0)) * span,
+        max: (current.max ?? 0) + ((next.max ?? 0) - (current.max ?? 0)) * span
       }
     }
   }
-  const last = RECOMMENDED_FLOW_ZONE[RECOMMENDED_FLOW_ZONE.length-1]
-  return { min: last.min, max: last.max }
+  const last = nodes[nodes.length-1]
+  return { min: last.min ?? 0, max: last.max ?? 0 }
 }
 
 function median(values){
@@ -97,6 +126,7 @@ export default function App(){
   const [currentProfile,setCurrentProfile]=useLocalStorage('mentor.currentProfile', 'default')
   const [scale,setScale]=useLocalStorage(`mentor.${currentProfile}.scale`, 0.001)
   const [zeroRaw,setZeroRaw]=useLocalStorage(`mentor.${currentProfile}.zeroRaw`, 0)
+  const [zonePreset,setZonePreset]=useLocalStorage('mentor.flowZonePreset', 'SINPF')
   const [tareApplied,setTareApplied]=useState(false)
   const [tareValueG,setTareValueG]=useState(0)
   const [tareTime,setTareTime]=useState(null)
@@ -108,6 +138,8 @@ export default function App(){
   const [running,setRunning]=useState(false)
   const [elapsed,setElapsed]=useState(0)
   const [extractionInfo,setExtractionInfo]=useState({active:false,duration:0,lastDuration:0})
+
+  const activeZone=useMemo(()=>FLOW_ZONE_PRESETS[zonePreset] || FLOW_ZONE_PRESETS.SINPF,[zonePreset])
 
   const scaleRef=useRef(scale)
   const zeroRawRef=useRef(zeroRaw)
@@ -189,6 +221,15 @@ export default function App(){
   },[currentProfile])
 
   const analysis=useMemo(()=>{
+    const zoneConfig=activeZone || FLOW_ZONE_PRESETS.SINPF
+    const zoneNodes=zoneConfig?.nodes || []
+    const zoneMeta={
+      id: zoneConfig?.id || 'SINPF',
+      label: zoneConfig?.label || 'Zona segura',
+      short: zoneConfig?.shortLabel || 'sin preinfusión',
+      description: zoneConfig?.description || ''
+    }
+
     if(samples.length<3){
       return {
         preinfusionDuration:0,
@@ -212,7 +253,11 @@ export default function App(){
         zoneCoverage:{inside:0,below:0,above:0},
         zoneAverageGap:0,
         zoneMaxGap:0,
-        zoneSummary:''
+        zoneSummary:`Sin datos suficientes para comparar con la zona ${zoneMeta.short}.`,
+        zonePresetId:zoneMeta.id,
+        zoneLabel:zoneMeta.label,
+        zoneShort:zoneMeta.short,
+        zoneDescription:zoneMeta.description
       }
     }
 
@@ -257,7 +302,11 @@ export default function App(){
         zoneCoverage:{inside:0,below:0,above:0},
         zoneAverageGap:0,
         zoneMaxGap:0,
-        zoneSummary:''
+        zoneSummary:`Sin datos suficientes para comparar con la zona ${zoneMeta.short}.`,
+        zonePresetId:zoneMeta.id,
+        zoneLabel:zoneMeta.label,
+        zoneShort:zoneMeta.short,
+        zoneDescription:zoneMeta.description
       }
     }
 
@@ -344,7 +393,7 @@ export default function App(){
     let zoneMaxGap=0
     for(let i=0;i<activeSamples.length;i++){
       const progress = activeDuration>0 ? (activeSamples[i].t-activeTimes[0]) / Math.max(activeDuration, 1e-6) : 0
-      const zone=interpolateZone(progress)
+      const zone=interpolateZone(zoneNodes, progress)
       zoneGuide.push({ t: activeSamples[i].t, min: zone.min, max: zone.max })
       if(i===0) continue
       const dt=Math.max(0, activeSamples[i].t-activeSamples[i-1].t)
@@ -370,19 +419,20 @@ export default function App(){
       above:clamp((zoneAbove/zoneTotal)*100,0,100)
     }
     const zoneAverageGap=zoneGapWeighted/zoneTotal
-    let zoneSummary
+    let zoneNarrative
     if(zoneCoverage.inside>65){
-      zoneSummary='Extracción alineada con la zona recomendada durante la mayor parte del tiro.'
+      zoneNarrative='Extracción alineada con la zona recomendada durante la mayor parte del tiro.'
     }else if(zoneCoverage.above>zoneCoverage.below){
-      zoneSummary='Predominan caudales por encima de la zona; riesgo de sub-extracción o canalización.'
+      zoneNarrative='Predominan caudales por encima de la zona; riesgo de sub-extracción o canalización.'
     }else if(zoneCoverage.below>zoneCoverage.above){
-      zoneSummary='Predominan caudales por debajo de la zona; posible sobre-extracción por resistencia alta.'
+      zoneNarrative='Predominan caudales por debajo de la zona; posible sobre-extracción por resistencia alta.'
     }else{
-      zoneSummary='Flujo alternando entre los límites recomendados; ajusta distribución y molienda.'
+      zoneNarrative='Flujo alternando entre los límites recomendados; ajusta distribución y molienda.'
     }
     if(zoneMaxGap>0.35){
-      zoneSummary+=` Picos fuera de zona de hasta ${zoneMaxGap.toFixed(2)} g/s.`
+      zoneNarrative+=` Picos fuera de zona de hasta ${zoneMaxGap.toFixed(2)} g/s.`
     }
+    const zoneSummary=`Zona ${zoneMeta.short}: ${zoneNarrative}`
 
     return {
       preinfusionDuration:Math.max(0, preinfusionDuration),
@@ -406,9 +456,13 @@ export default function App(){
       zoneCoverage,
       zoneAverageGap:isFinite(zoneAverageGap)?zoneAverageGap:0,
       zoneMaxGap:isFinite(zoneMaxGap)?zoneMaxGap:0,
-      zoneSummary
+      zoneSummary,
+      zonePresetId:zoneMeta.id,
+      zoneLabel:zoneMeta.label,
+      zoneShort:zoneMeta.short,
+      zoneDescription:zoneMeta.description
     }
-  },[samples])
+  },[samples, activeZone])
 
   useEffect(()=>{ return ()=>{ cleanupNotifications(); try{ deviceRef.current?.gatt?.disconnect() }catch{} } },[])
 
@@ -684,11 +738,10 @@ export default function App(){
 
   const chartData=useMemo(()=>{
     const labels=samples.map(s=>s.t.toFixed(2))
-    const safeMinLine=samples.map(()=>FLOW_OPTIMAL_MIN)
-    const safeMaxLine=samples.map(()=>FLOW_OPTIMAL_MAX)
     const preinfusionLine=samples.map(()=>PREINFUSION_THRESHOLD)
     const preIndex=analysis.preinfusionIndex||0
     const zoneGuide=analysis.zoneGuide||[]
+    const zoneLabel=analysis.zoneShort ? `Zona segura (${analysis.zoneShort})` : 'Zona segura'
     const zoneMaxLine=samples.map((_,idx)=>{
       if(idx<preIndex){ return PREINFUSION_THRESHOLD }
       const guide=zoneGuide[idx-preIndex]
@@ -733,43 +786,26 @@ export default function App(){
           pointRadius:0,
         },
         {
-          label:'Zona recomendada (máximo)',
-          yAxisID:'y1',
-          data:zoneMaxLine,
-          fill:false,
-          borderColor:'rgba(59,130,246,0.9)',
-          borderWidth:1.5,
-          pointRadius:0,
-          tension:0.2
-        },
-        {
-          label:'Zona recomendada (mínimo)',
+          label:zoneLabel,
           yAxisID:'y1',
           data:zoneMinLine,
-          borderColor:'rgba(245,158,11,0.95)',
-          borderWidth:1.2,
+          borderColor:'rgba(34,197,94,0)',
+          backgroundColor:'rgba(34,197,94,0)',
           pointRadius:0,
-          tension:0.2,
+          tension:0.25,
+          fill:false,
+          skipLegend:true,
+        },
+        {
+          label:zoneLabel,
+          yAxisID:'y1',
+          data:zoneMaxLine,
+          borderColor:'rgba(34,197,94,0)',
+          borderWidth:0,
+          pointRadius:0,
+          tension:0.25,
           fill:'-1',
-          backgroundColor:'rgba(250,204,21,0.18)'
-        },
-        {
-          label:`Límite seguro mínimo (${FLOW_OPTIMAL_MIN} g/s)`,
-          yAxisID:'y1',
-          data:safeMinLine,
-          borderColor:'rgba(110,231,183,0.9)',
-          borderDash:[6,6],
-          pointRadius:0,
-          fill:false,
-        },
-        {
-          label:`Límite seguro máximo (${FLOW_OPTIMAL_MAX} g/s)`,
-          yAxisID:'y1',
-          data:safeMaxLine,
-          borderColor:'rgba(248,113,113,0.9)',
-          borderDash:[6,6],
-          pointRadius:0,
-          fill:false,
+          backgroundColor:'rgba(34,197,94,0.22)'
         },
         {
           label:`Preinfusión (${PREINFUSION_THRESHOLD} g/s)`,
@@ -790,7 +826,16 @@ export default function App(){
     animation:false,
     interaction:{mode:'index',intersect:false},
     plugins:{
-      legend:{display:true,labels:{usePointStyle:true}},
+      legend:{
+        display:true,
+        labels:{
+          usePointStyle:true,
+          filter:(legendItem, data)=>{
+            const dataset=data?.datasets?.[legendItem.datasetIndex]
+            return !dataset?.skipLegend
+          }
+        }
+      },
       tooltip:{
         callbacks:{
           label:(ctx)=>{
@@ -830,6 +875,170 @@ export default function App(){
     a.click()
   }
 
+  async function downloadPanelComposite(){
+    if(!samples.length) return
+    const chart=chartRef.current
+    const chartInstance=chart && typeof chart.toBase64Image==='function' ? chart : chart?.chartInstance
+    if(!chartInstance || typeof chartInstance.toBase64Image!=='function') return
+    const chartCanvas=chartInstance.canvas || chartInstance.ctx?.canvas || null
+    try{
+      const chartUrl=chartInstance.toBase64Image('image/png',1)
+      const chartImage=new Image()
+      const loadImage=()=>new Promise((resolve,reject)=>{
+        chartImage.onload=()=>resolve()
+        chartImage.onerror=reject
+      })
+      chartImage.src=chartUrl
+      await loadImage()
+
+      const safeFixed=(value,digits=2)=>Number.isFinite(value)? value.toFixed(digits): (0).toFixed(digits)
+      const cards=[
+        {
+          title:'Relación resistencia-flujo',
+          metric:`${safeFixed(analysis.hydraulicScore,0)} índice`,
+          details:[
+            { text:`Promedio: ${safeFixed(analysis.avgFlow)} g/s • Pico: ${safeFixed(analysis.peakFlow)} g/s • Final: ${safeFixed(analysis.finalFlow)} g/s`, color:'#475569' },
+            { text:`Rampa inicial: ${safeFixed(analysis.rampSlope)} g/s² • Tiempo a 90% pico: ${analysis.rampTime>0?`${analysis.rampTime.toFixed(1)} s`:'—'}`, color:'#475569' },
+            { text:analysis.hydraulicSummary, color:'#0f172a' }
+          ]
+        },
+        {
+          title:'Índice de canalización',
+          metric:`${safeFixed(analysis.channelingIndex,0)} /100`,
+          details:[
+            { text:`Picos detectados: ${analysis.channelingSpikes} • Máx aceleración: ${safeFixed(analysis.maxAccel)} g/s²`, color:'#475569' },
+            { text:analysis.channelingSummary, color:'#0f172a' }
+          ]
+        },
+        {
+          title:'Distribución del flujo',
+          metric:`Óptimo: ${safeFixed(analysis.flowDistribution.optimal,0)}%`,
+          details:[
+            { text:`Bajo: ${safeFixed(analysis.flowDistribution.low,0)}% • Alto: ${safeFixed(analysis.flowDistribution.high,0)}%`, color:'#475569' },
+            { text:`Preinfusión: ${analysis.preinfusionDuration>0?`${analysis.preinfusionDuration.toFixed(1)} s`:'—'} • Flujo mínimo: ${safeFixed(analysis.minFlow)} g/s`, color:'#475569' },
+            { text:`Rango clásico: ${FLOW_OPTIMAL_MIN}-${FLOW_OPTIMAL_MAX} g/s`, color:'#475569' },
+            { text:analysis.flowDistributionSummary, color:'#0f172a' }
+          ]
+        },
+        {
+          title:`Zona segura (${analysis.zoneShort})`,
+          metric:`En zona: ${safeFixed(analysis.zoneCoverage.inside,0)}%`,
+          details:[
+            { text:analysis.zoneLabel, color:'#475569' },
+            analysis.zoneDescription ? { text:analysis.zoneDescription, color:'#64748b' } : null,
+            { text:`Debajo: ${safeFixed(analysis.zoneCoverage.below,0)}% • Encima: ${safeFixed(analysis.zoneCoverage.above,0)}%`, color:'#475569' },
+            { text:`Brecha media: ${safeFixed(analysis.zoneAverageGap)} g/s • Máx brecha: ${safeFixed(analysis.zoneMaxGap)} g/s`, color:'#475569' },
+            { text:analysis.zoneSummary, color:'#0f172a' }
+          ].filter(Boolean)
+        }
+      ]
+
+      const width=1280
+      const margin=56
+      const headerHeight=130
+      const gap=28
+      const cardColumns=2
+      const cardWidth=(width - margin*2 - gap*(cardColumns-1))/cardColumns
+      const cardHeight=230
+      const cardRows=Math.ceil(cards.length/cardColumns)
+      const cardsAreaHeight=cardRows*cardHeight + (cardRows-1)*gap
+      const panelHeight=headerHeight + cardsAreaHeight
+      const chartTargetWidth=width - margin*2
+      const baseChartWidth=chartCanvas?.width || chartImage.width || chartTargetWidth
+      const baseChartHeight=chartCanvas?.height || chartImage.height || (chartTargetWidth*0.5)
+      const chartScale=baseChartWidth? chartTargetWidth/Math.max(baseChartWidth,1) : 1
+      const chartTargetHeight=Math.round(baseChartHeight * chartScale)
+      const chartSpacing=48
+      const totalHeight=Math.round(margin + panelHeight + chartSpacing + chartTargetHeight + margin)
+
+      const canvas=document.createElement('canvas')
+      canvas.width=width
+      canvas.height=totalHeight
+      const ctx=canvas.getContext('2d')
+      if(!ctx) return
+      ctx.fillStyle='#ffffff'
+      ctx.fillRect(0,0,width,totalHeight)
+
+      ctx.fillStyle='#0f172a'
+      ctx.font='bold 34px Arial'
+      ctx.fillText('Panel de resultados', margin, margin+40)
+      ctx.font='20px Arial'
+      ctx.fillStyle='#1e293b'
+      ctx.fillText(analysis.zoneLabel||'', margin, margin+72)
+      ctx.font='16px Arial'
+      ctx.fillStyle='#64748b'
+      ctx.fillText(`Generado: ${new Date().toLocaleString()}`, margin, margin+96)
+      ctx.fillText(`Muestras: ${samples.length}`, margin, margin+118)
+
+      const drawWrappedText=(textCtx,text,x,y,maxWidth,lineHeight)=>{
+        if(!text){ return y }
+        const words=String(text).split(/\s+/)
+        let line=''
+        let currentY=y
+        for(const word of words){
+          const testLine=line? `${line} ${word}` : word
+          if(textCtx.measureText(testLine).width>maxWidth && line){
+            textCtx.fillText(line, x, currentY)
+            line=word
+            currentY+=lineHeight
+          }else{
+            line=testLine
+          }
+        }
+        if(line){
+          textCtx.fillText(line, x, currentY)
+          currentY+=lineHeight
+        }
+        return currentY
+      }
+
+      const drawCard=(card, index)=>{
+        const row=Math.floor(index/cardColumns)
+        const col=index%cardColumns
+        const x=margin + col*(cardWidth+gap)
+        const y=margin + headerHeight + row*(cardHeight+gap)
+        ctx.fillStyle='#f8fafc'
+        ctx.fillRect(x, y, cardWidth, cardHeight)
+        ctx.strokeStyle='#e2e8f0'
+        ctx.lineWidth=1
+        ctx.strokeRect(x, y, cardWidth, cardHeight)
+        ctx.fillStyle='#0f172a'
+        ctx.font='bold 20px Arial'
+        ctx.fillText(card.title, x+16, y+32)
+        ctx.font='24px Arial'
+        ctx.fillText(card.metric, x+16, y+62)
+        let textY=y+92
+        const maxWidth=cardWidth-32
+        ctx.font='16px Arial'
+        card.details.forEach(detail=>{
+          ctx.fillStyle=detail?.color || '#475569'
+          textY=drawWrappedText(ctx, detail?.text || '', x+16, textY, maxWidth, 20)
+          textY+=6
+        })
+      }
+
+      cards.forEach((card,idx)=>drawCard(card, idx))
+
+      const chartY=margin + panelHeight + chartSpacing
+      ctx.fillStyle='#f8fafc'
+      ctx.fillRect(margin-8, chartY-32, chartTargetWidth+16, chartTargetHeight+48)
+      ctx.strokeStyle='#e2e8f0'
+      ctx.strokeRect(margin-8, chartY-32, chartTargetWidth+16, chartTargetHeight+48)
+      ctx.fillStyle='#0f172a'
+      ctx.font='bold 22px Arial'
+      ctx.fillText('Curva de peso y flujo', margin, chartY-6)
+      ctx.drawImage(chartImage, margin, chartY, chartTargetWidth, chartTargetHeight)
+
+      const compositeUrl=canvas.toDataURL('image/png')
+      const a=document.createElement('a')
+      a.href=compositeUrl
+      a.download='panel_grafico.png'
+      a.click()
+    }catch(err){
+      console.error('No se pudo exportar el panel', err)
+    }
+  }
+
   function downloadResults(){
     const payload={
       generatedAt:new Date().toISOString(),
@@ -852,7 +1061,14 @@ export default function App(){
         preinfusionThreshold:PREINFUSION_THRESHOLD,
         zoneCoverage:analysis.zoneCoverage,
         zoneAverageGap:analysis.zoneAverageGap,
-        zoneMaxGap:analysis.zoneMaxGap
+        zoneMaxGap:analysis.zoneMaxGap,
+        zonePresetId:analysis.zonePresetId
+      },
+      zonePreset:{
+        id:analysis.zonePresetId,
+        label:analysis.zoneLabel,
+        short:analysis.zoneShort,
+        description:analysis.zoneDescription
       },
       narratives:{
         hydraulic:analysis.hydraulicSummary,
@@ -953,9 +1169,22 @@ export default function App(){
         </div>
 
         <div className="section card" style={{marginBottom:16}}>
-          <div className="row" style={{justifyContent:'space-between',alignItems:'center'}}>
-            <h3 style={{margin:'0'}}>Panel de resultados</h3>
-            <button onClick={downloadResults} disabled={samples.length===0}>Exportar panel</button>
+          <div className="row" style={{justifyContent:'space-between',alignItems:'center',gap:12,flexWrap:'wrap'}}>
+            <div className="row" style={{alignItems:'center',gap:12,flexWrap:'wrap'}}>
+              <h3 style={{margin:'0'}}>Panel de resultados</h3>
+              <div className="row" style={{alignItems:'center',gap:8}}>
+                <label htmlFor="zonePreset" className="sub">Zona segura</label>
+                <select id="zonePreset" value={zonePreset} onChange={e=>setZonePreset(e.target.value)}>
+                  {Object.values(FLOW_ZONE_PRESETS).map(zone=>(
+                    <option key={zone.id} value={zone.id}>{zone.optionLabel}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="row" style={{gap:8,flexWrap:'wrap'}}>
+              <button onClick={downloadPanelComposite} disabled={samples.length===0}>Exportar panel + gráfico</button>
+              <button onClick={downloadResults} disabled={samples.length===0}>Exportar datos (JSON)</button>
+            </div>
           </div>
           <div className="grid" style={{marginTop:12}}>
             <div className="card" style={{padding:'16px'}}>
@@ -979,8 +1208,10 @@ export default function App(){
               <div className="small">{analysis.flowDistributionSummary}</div>
             </div>
             <div className="card" style={{padding:'16px'}}>
-              <div className="sub">Zona recomendada de caudal</div>
+              <div className="sub">Zona segura de caudal ({analysis.zoneShort})</div>
               <div className="metric-sm">{analysis.zoneCoverage.inside.toFixed(0)} <span className="sub">% en zona</span></div>
+              <div className="small">{analysis.zoneLabel}</div>
+              {analysis.zoneDescription && <div className="small">{analysis.zoneDescription}</div>}
               <div className="small">Debajo: {analysis.zoneCoverage.below.toFixed(0)}% • Encima: {analysis.zoneCoverage.above.toFixed(0)}%</div>
               <div className="small">Brecha media: {analysis.zoneAverageGap.toFixed(2)} g/s • Máx brecha: {analysis.zoneMaxGap.toFixed(2)} g/s</div>
               <div className="small">{analysis.zoneSummary}</div>
