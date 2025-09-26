@@ -11,8 +11,16 @@ const DEFAULT_CHAR = '1bc50002-0200-0aa5-e311-24cb004a98c5'
 const FLOW_OPTIMAL_MIN = 1.5
 const FLOW_OPTIMAL_MAX = 3.5
 const PREINFUSION_THRESHOLD = 0.5
+const RAO_FLOW_START = 0.75
+const RAO_FLOW_END = 1.75
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
+const easeInOutCubic = (t) => {
+  const clamped = clamp(t, 0, 1)
+  return clamped < 0.5
+    ? 4 * clamped * clamped * clamped
+    : 1 - Math.pow(-2 * clamped + 2, 3) / 2
+}
 
 function median(values){
   if(!values.length) return 0
@@ -177,7 +185,13 @@ export default function App(){
         rampTime:0,
         finalFlow:0,
         minFlow:0,
-        rampSlope:0
+        rampSlope:0,
+        preinfusionIndex:0,
+        raoCurve:[],
+        raoDeviation:0,
+        raoMeanDeviation:0,
+        raoMaxDeviation:0,
+        raoSummary:''
       }
     }
 
@@ -216,7 +230,13 @@ export default function App(){
         rampTime:0,
         finalFlow:0,
         minFlow:0,
-        rampSlope:0
+        rampSlope:0,
+        preinfusionIndex:preIndex,
+        raoCurve:[],
+        raoDeviation:0,
+        raoMeanDeviation:0,
+        raoMaxDeviation:0,
+        raoSummary:''
       }
     }
 
@@ -295,6 +315,44 @@ export default function App(){
       }
     }
 
+    const raoCurve=activeSamples.map(sample=>{
+      const normalized=activeDuration>0 ? (sample.t-activeTimes[0]) / Math.max(activeDuration, 1e-6) : 0
+      const target=RAO_FLOW_START + (RAO_FLOW_END-RAO_FLOW_START) * easeInOutCubic(normalized)
+      return { t: sample.t, target }
+    })
+    let sumSq=0
+    let sumAbs=0
+    let maxDiff=0
+    let startDiff=0
+    let endDiff=0
+    if(raoCurve.length){
+      startDiff=activeSamples[0].flow - raoCurve[0].target
+      endDiff=activeSamples[raoCurve.length-1].flow - raoCurve[raoCurve.length-1].target
+    }
+    raoCurve.forEach((point, idx)=>{
+      const diff=activeSamples[idx].flow - point.target
+      if(!isFinite(diff)) return
+      sumSq+=diff*diff
+      sumAbs+=Math.abs(diff)
+      if(Math.abs(diff)>maxDiff){ maxDiff=Math.abs(diff) }
+    })
+    const raoDeviation = raoCurve.length ? Math.sqrt(sumSq/raoCurve.length) : 0
+    const raoMeanDeviation = raoCurve.length ? sumAbs/raoCurve.length : 0
+
+    let raoSummary
+    if(raoDeviation<0.2){
+      raoSummary='Curva muy alineada con la referencia de Scott Rao.'
+    }else if(raoDeviation<0.35){
+      raoSummary='Curva razonablemente cercana a la referencia de Scott Rao.'
+    }else{
+      raoSummary='Curva alejada de la referencia de Scott Rao; revisa molienda y distribución.'
+    }
+    const trendNotes=[]
+    if(Math.abs(startDiff)>0.3){ trendNotes.push(startDiff>0?'Inicia con más caudal que la referencia.':'Inicia más lenta que la referencia.') }
+    if(Math.abs(endDiff)>0.3){ trendNotes.push(endDiff>0?'Finaliza con más caudal del esperado.':'Finaliza por debajo del flujo objetivo.') }
+    if(!trendNotes.length && raoCurve.length){ trendNotes.push('Inicio y cierre muy cercanos a la guía propuesta.') }
+    raoSummary+=` ${trendNotes.join(' ')}`
+
     return {
       preinfusionDuration:Math.max(0, preinfusionDuration),
       avgFlow:isFinite(avgFlow)?avgFlow:0,
@@ -311,7 +369,13 @@ export default function App(){
       rampTime:Math.max(0,rampTime),
       finalFlow:isFinite(finalFlow)?finalFlow:0,
       minFlow:isFinite(minFlow)?minFlow:0,
-      rampSlope:isFinite(rampSlope)?rampSlope:0
+      rampSlope:isFinite(rampSlope)?rampSlope:0,
+      preinfusionIndex:preIndex,
+      raoCurve,
+      raoDeviation:isFinite(raoDeviation)?raoDeviation:0,
+      raoMeanDeviation:isFinite(raoMeanDeviation)?raoMeanDeviation:0,
+      raoMaxDeviation:isFinite(maxDiff)?maxDiff:0,
+      raoSummary
     }
   },[samples])
 
@@ -592,6 +656,18 @@ export default function App(){
     const safeMinLine=samples.map(()=>FLOW_OPTIMAL_MIN)
     const safeMaxLine=samples.map(()=>FLOW_OPTIMAL_MAX)
     const preinfusionLine=samples.map(()=>PREINFUSION_THRESHOLD)
+    const preIndex=analysis.preinfusionIndex||0
+    const raoCurve=analysis.raoCurve||[]
+    const raoLine=samples.map((_,idx)=>{
+      if(idx<preIndex){ return RAO_FLOW_START }
+      const curvePoint=raoCurve[idx-preIndex]
+      if(curvePoint && isFinite(curvePoint.target)){ return Number(curvePoint.target.toFixed(3)) }
+      if(raoCurve.length){
+        const last=raoCurve[raoCurve.length-1]
+        return isFinite(last.target)?Number(last.target.toFixed(3)):RAO_FLOW_END
+      }
+      return RAO_FLOW_START
+    })
     return {
       labels,
       datasets:[
@@ -613,6 +689,15 @@ export default function App(){
           borderColor:'rgba(242,153,74,1)',
           backgroundColor:'rgba(242,153,74,0.25)',
           tension:0.25,
+          pointRadius:0,
+        },
+        {
+          label:'Referencia Rao (g/s)',
+          yAxisID:'y1',
+          data:raoLine,
+          fill:false,
+          borderColor:'rgba(56,189,248,0.9)',
+          borderDash:[6,3],
           pointRadius:0,
         },
         {
@@ -644,7 +729,7 @@ export default function App(){
         }
       ]
     }
-  },[samples])
+  },[analysis, samples])
 
   const chartOptions=useMemo(()=>({
     responsive:true,
@@ -711,12 +796,16 @@ export default function App(){
         rampSlope:analysis.rampSlope,
         minFlow:analysis.minFlow,
         safeFlowRange:[FLOW_OPTIMAL_MIN,FLOW_OPTIMAL_MAX],
-        preinfusionThreshold:PREINFUSION_THRESHOLD
+        preinfusionThreshold:PREINFUSION_THRESHOLD,
+        raoDeviationRMS:analysis.raoDeviation,
+        raoMeanDeviation:analysis.raoMeanDeviation,
+        raoMaxDeviation:analysis.raoMaxDeviation
       },
       narratives:{
         hydraulic:analysis.hydraulicSummary,
         channeling:analysis.channelingSummary,
-        distribution:analysis.flowDistributionSummary
+        distribution:analysis.flowDistributionSummary,
+        rao:analysis.raoSummary
       }
     }
     const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'})
@@ -835,6 +924,12 @@ export default function App(){
               <div className="small">En rango ({FLOW_OPTIMAL_MIN}-{FLOW_OPTIMAL_MAX} g/s): {analysis.flowDistribution.optimal.toFixed(0)}%</div>
               <div className="small">Bajo rango: {analysis.flowDistribution.low.toFixed(0)}% • Alto rango: {analysis.flowDistribution.high.toFixed(0)}%</div>
               <div className="small">{analysis.flowDistributionSummary}</div>
+            </div>
+            <div className="card" style={{padding:'16px'}}>
+              <div className="sub">Referencia Scott Rao</div>
+              <div className="metric-sm">{analysis.raoDeviation.toFixed(2)} <span className="sub">RMS g/s</span></div>
+              <div className="small">Desviación media: {analysis.raoMeanDeviation.toFixed(2)} g/s • Máx diferencia: {analysis.raoMaxDeviation.toFixed(2)} g/s</div>
+              <div className="small">{analysis.raoSummary}</div>
             </div>
           </div>
         </div>
