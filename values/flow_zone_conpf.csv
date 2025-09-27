@@ -1,0 +1,23 @@
+segment,label,progress,min,max
+P1,Banda preinfusión,0,0,0
+P1,Banda preinfusión,0.1,0.3,0.7
+P1,Banda preinfusión,0.22,0.6,1.1
+P1,Banda preinfusión,0.36,0.9,1.4
+P1,Banda preinfusión,0.5,1.1,1.6
+P1,Banda preinfusión,0.66,1.0,1.4
+P1,Banda preinfusión,0.82,0.8,1.2
+P1,Banda preinfusión,1,0.6,0.9
+P2,Banda media,0,0,0
+P2,Banda media,0.18,1.1,1.7
+P2,Banda media,0.32,1.4,1.9
+P2,Banda media,0.48,1.6,2.1
+P2,Banda media,0.64,1.5,2.0
+P2,Banda media,0.8,1.2,1.6
+P2,Banda media,1,0.9,1.2
+P3,Banda alta,0,0,0
+P3,Banda alta,0.28,1.8,2.3
+P3,Banda alta,0.44,2.0,2.5
+P3,Banda alta,0.6,1.9,2.3
+P3,Banda alta,0.76,1.5,2.0
+P3,Banda alta,0.9,1.1,1.5
+P3,Banda alta,1,0,0
