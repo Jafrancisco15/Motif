@@ -144,11 +144,6 @@ const FLOW_ZONE_PRESETS = Object.fromEntries(
       {
         ...meta,
         nodes: parsed.envelope.map(({ progress, min, max })=>({ progress, min, max })),
-        bands: parsed.segments.map((segment, index)=>({
-          id: segment.id || `segment-${index+1}`,
-          label: segment.label || `Segmento ${index+1}`,
-          nodes: segment.nodes
-        })),
         envelope: parsed.envelope
       }
     ]
@@ -423,7 +418,6 @@ export default function App(){
   const analysis=useMemo(()=>{
     const zoneConfig=activeZone || FLOW_ZONE_PRESETS.SINPF
     const zoneNodes=zoneConfig?.nodes || []
-    const zoneBands=zoneConfig?.bands || []
     const zoneMeta={
       id: zoneConfig?.id || 'SINPF',
       label: zoneConfig?.label || 'Zona segura',
@@ -451,8 +445,6 @@ export default function App(){
         rampSlope:0,
         preinfusionIndex:0,
         zoneGuide:[],
-        zoneBands:zoneBands.map(band=>({ id: band.id, label: band.label })),
-        zoneBandsSeries:zoneBands.map(()=>({ min:[], max:[] })),
         zoneCoverage:{inside:0,below:0,above:0},
         zoneAverageGap:0,
         zoneMaxGap:0,
@@ -502,8 +494,6 @@ export default function App(){
         rampSlope:0,
         preinfusionIndex:preIndex,
         zoneGuide:[],
-        zoneBands:zoneBands.map(band=>({ id: band.id, label: band.label })),
-        zoneBandsSeries:zoneBands.map(()=>({ min:[], max:[] })),
         zoneCoverage:{inside:0,below:0,above:0},
         zoneAverageGap:0,
         zoneMaxGap:0,
@@ -591,7 +581,6 @@ export default function App(){
     }
 
     const zoneGuide=[]
-    const zoneBandSeries=zoneBands.map(()=>({ min:[], max:[] }))
     let zoneInside=0
     let zoneBelow=0
     let zoneAbove=0
@@ -599,70 +588,25 @@ export default function App(){
     let zoneMaxGap=0
     for(let i=0;i<activeSamples.length;i++){
       const progress = activeDuration>0 ? (activeSamples[i].t-activeTimes[0]) / Math.max(activeDuration, 1e-6) : 0
-      const bandRanges=zoneBands.map((band, idx)=>{
-        const range=interpolateNodes(band.nodes, progress)
-        if(range){
-          zoneBandSeries[idx].min.push(range.min)
-          zoneBandSeries[idx].max.push(range.max)
-          return { ...range, bandId: band.id, label: band.label }
-        }
-        zoneBandSeries[idx].min.push(null)
-        zoneBandSeries[idx].max.push(null)
-        return null
-      }).filter(Boolean)
-      const envelopeRange = bandRanges.length
-        ? {
-            min: Math.min(...bandRanges.map(range=>range.min)),
-            max: Math.max(...bandRanges.map(range=>range.max))
-          }
-        : (interpolateNodes(zoneNodes, progress) || { min:0, max:0 })
+      const envelopeRange = interpolateNodes(zoneNodes, progress) || { min:0, max:0 }
       zoneGuide.push({
         t: activeSamples[i].t,
-        ranges: bandRanges,
         min: envelopeRange.min,
         max: envelopeRange.max
       })
       if(i===0) continue
       const dt=Math.max(0, activeSamples[i].t-activeSamples[i-1].t)
       const flow=activeSamples[i].flow
-      const insideBand = bandRanges.some(range=>flow>=range.min && flow<=range.max)
-      if(insideBand){
-        zoneInside+=dt
-        continue
-      }
-      let classification=null
+      let classification
       let gapValue=0
-      if(bandRanges.length){
-        let nearestGap=Infinity
-        bandRanges.forEach(range=>{
-          const belowGap=range.min-flow
-          if(belowGap>0 && belowGap<nearestGap){
-            nearestGap=belowGap
-            classification='below'
-          }
-          const aboveGap=flow-range.max
-          if(aboveGap>0 && aboveGap<nearestGap){
-            nearestGap=aboveGap
-            classification='above'
-          }
-        })
-        if(Number.isFinite(nearestGap) && nearestGap!==Infinity){
-          gapValue=Math.max(0, nearestGap)
-        }else{
-          classification=null
-        }
-      }
-      if(classification===null){
-        if(flow<envelopeRange.min){
-          classification='below'
-          gapValue=envelopeRange.min-flow
-        }else if(flow>envelopeRange.max){
-          classification='above'
-          gapValue=flow-envelopeRange.max
-        }else{
-          classification='inside'
-          gapValue=0
-        }
+      if(flow>=envelopeRange.min && flow<=envelopeRange.max){
+        classification='inside'
+      }else if(flow<envelopeRange.min){
+        classification='below'
+        gapValue=envelopeRange.min-flow
+      }else{
+        classification='above'
+        gapValue=flow-envelopeRange.max
       }
       if(classification==='inside'){
         zoneInside+=dt
@@ -717,11 +661,6 @@ export default function App(){
       rampSlope:isFinite(rampSlope)?rampSlope:0,
       preinfusionIndex:preIndex,
       zoneGuide,
-      zoneBands:zoneBands.map(band=>({ id: band.id, label: band.label })),
-      zoneBandsSeries:zoneBandSeries.map(series=>({
-        min: series.min,
-        max: series.max
-      })),
       zoneCoverage,
       zoneAverageGap:isFinite(zoneAverageGap)?zoneAverageGap:0,
       zoneMaxGap:isFinite(zoneMaxGap)?zoneMaxGap:0,
@@ -1010,72 +949,24 @@ export default function App(){
 
   const chartData=useMemo(()=>{
     const labels=samples.map(s=>s.t.toFixed(2))
-    const preinfusionLine=samples.map(()=>PREINFUSION_THRESHOLD)
     const preIndex=analysis.preinfusionIndex||0
     const zoneGuide=analysis.zoneGuide||[]
-    const zoneBandsSeries=analysis.zoneBandsSeries||[]
-    const zoneBandsMeta=analysis.zoneBands||[]
     const zoneLabel=analysis.zoneShort ? `Zona segura (${analysis.zoneShort})` : 'Zona segura'
     const zoneDatasets=[]
-    const zoneColors=['rgba(34,197,94,0.22)','rgba(16,185,129,0.2)','rgba(21,128,61,0.18)','rgba(134,239,172,0.16)']
-
-    if(zoneBandsSeries.length){
-      zoneBandsSeries.forEach((series, idx)=>{
-        const meta=zoneBandsMeta[idx] || {}
-        const bandLabel = meta.label ? `${zoneLabel} • ${meta.label}` : `${zoneLabel} • segmento ${idx+1}`
-        const minLine=samples.map((_, sampleIdx)=>{
-          if(sampleIdx<preIndex){ return null }
-          const localIndex=sampleIdx-preIndex
-          const value=series?.min?.[localIndex]
-          return Number.isFinite(value)? Number(value.toFixed(3)) : null
-        })
-        const maxLine=samples.map((_, sampleIdx)=>{
-          if(sampleIdx<preIndex){ return null }
-          const localIndex=sampleIdx-preIndex
-          const value=series?.max?.[localIndex]
-          return Number.isFinite(value)? Number(value.toFixed(3)) : null
-        })
-        const fillColor=zoneColors[idx % zoneColors.length]
-        zoneDatasets.push({
-          label: bandLabel,
-          yAxisID:'y1',
-          data:minLine,
-          borderColor:'rgba(34,197,94,0)',
-          backgroundColor:'rgba(34,197,94,0)',
-          pointRadius:0,
-          tension:0.25,
-          skipLegend:true,
-          spanGaps:true,
-          fill:false
-        })
-        zoneDatasets.push({
-          label: bandLabel,
-          yAxisID:'y1',
-          data:maxLine,
-          borderColor:'rgba(34,197,94,0)',
-          backgroundColor:fillColor,
-          pointRadius:0,
-          tension:0.25,
-          borderWidth:0,
-          fill:'-1',
-          spanGaps:true,
-          skipLegend:false
-        })
-      })
-    }else if(zoneGuide.length){
+    if(zoneGuide.length){
       const zoneMaxLine=samples.map((_,idx)=>{
-        if(idx<preIndex){ return PREINFUSION_THRESHOLD }
+        if(idx<preIndex){ return null }
         const guide=zoneGuide[idx-preIndex]
         if(guide && isFinite(guide.max)){ return Number(guide.max.toFixed(3)) }
         const last=zoneGuide[zoneGuide.length-1]
-        return last && isFinite(last.max)? Number(last.max.toFixed(3)) : PREINFUSION_THRESHOLD
+        return last && isFinite(last.max)? Number(last.max.toFixed(3)) : null
       })
       const zoneMinLine=samples.map((_,idx)=>{
-        if(idx<preIndex){ return 0 }
+        if(idx<preIndex){ return null }
         const guide=zoneGuide[idx-preIndex]
         if(guide && isFinite(guide.min)){ return Number(guide.min.toFixed(3)) }
         const last=zoneGuide[zoneGuide.length-1]
-        return last && isFinite(last.min)? Number(last.min.toFixed(3)) : 0
+        return last && isFinite(last.min)? Number(last.min.toFixed(3)) : null
       })
       zoneDatasets.push({
         label:zoneLabel,
@@ -1123,16 +1014,7 @@ export default function App(){
           tension:0.25,
           pointRadius:0,
         },
-        ...zoneDatasets,
-        {
-          label:`Preinfusión (${PREINFUSION_THRESHOLD} g/s)`,
-          yAxisID:'y1',
-          data:preinfusionLine,
-          borderColor:'rgba(129,140,248,0.9)',
-          borderDash:[4,4],
-          pointRadius:0,
-          fill:false,
-        }
+        ...zoneDatasets
       ]
     }
   },[analysis, samples])
@@ -1388,12 +1270,8 @@ export default function App(){
         description:analysis.zoneDescription,
         envelope:(activeZone?.envelope||[]).map(point=>(
           { progress:point.progress, min:point.min, max:point.max }
-        )),
-        bands:(activeZone?.bands||[]).map(band=>(
-          { id:band.id, label:band.label, nodes:band.nodes }
         ))
       },
-      zoneSeries:analysis.zoneBandsSeries,
       zoneGuide:analysis.zoneGuide,
       narratives:{
         hydraulic:analysis.hydraulicSummary,
