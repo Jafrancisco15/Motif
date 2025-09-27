@@ -152,6 +152,62 @@ const FLOW_ZONE_PRESETS = Object.fromEntries(
 
 const randomBetween = (min, max) => min + (max - min) * Math.random()
 
+const formatNumber = (value, decimals = 0) => Number.isFinite(value) ? value.toFixed(decimals) : '—'
+
+function HorizontalMetricBar({ label, value, max = 100, unit = '', color = '#38bdf8', decimals = 0 }){
+  const safeValue = Number.isFinite(value) ? value : 0
+  const safeMax = max > 0 ? max : 1
+  const ratio = clamp(safeValue / safeMax, 0, 1)
+  return (
+    <div className="result-bar">
+      <div className="result-bar-header">
+        <span className="result-bar-label">{label}</span>
+        <span className="result-bar-value">{formatNumber(safeValue, decimals)}{unit}</span>
+      </div>
+      <div className="result-bar-track">
+        <div className="result-bar-fill" style={{width:`${ratio*100}%`, background:color}} />
+      </div>
+    </div>
+  )
+}
+
+function ResultStackedBar({ label, segments = [], unit = '%' }){
+  const total = segments.reduce((sum, segment)=> sum + (Number.isFinite(segment.value) ? Math.max(segment.value,0) : 0), 0)
+  const safeTotal = total > 0 ? total : segments.reduce((sum, segment)=> sum + (segment.fallback || 0), 0) || 1
+  return (
+    <div className="result-stacked">
+      <div className="result-bar-header">
+        <span className="result-bar-label">{label}</span>
+        <span className="result-bar-value">{segments.map(segment=>`${segment.label} ${formatNumber(segment.value||0,0)}${unit}`).join(' • ')}</span>
+      </div>
+      <div className="result-stacked-track">
+        {segments.map(segment=>{
+          const safeValue = Number.isFinite(segment.value) ? Math.max(segment.value,0) : 0
+          const ratio = safeValue / safeTotal
+          return (
+            <div
+              key={segment.key || segment.label}
+              className="result-stacked-segment"
+              style={{
+                width:`${Math.max(0, Math.min(1, ratio))*100}%`,
+                background:segment.color || '#38bdf8'
+              }}
+            />
+          )
+        })}
+      </div>
+      <div className="result-legend">
+        {segments.map(segment=>(
+          <div key={`legend-${segment.key || segment.label}`} className="legend-item">
+            <span className="legend-dot" style={{background:segment.color || '#38bdf8'}} />
+            <span className="legend-label">{segment.label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function generateSimulatedExtraction(mode='optimal'){
   const dt=0.25
   const totalSteps=Math.max(96, Math.round(randomBetween(24, 32)/dt))
@@ -1101,41 +1157,55 @@ export default function App(){
       const cards=[
         {
           title:'Relación resistencia-flujo',
-          metric:`${safeFixed(analysis.hydraulicScore,0)} índice`,
-          details:[
-            { text:`Promedio: ${safeFixed(analysis.avgFlow)} g/s • Pico: ${safeFixed(analysis.peakFlow)} g/s • Final: ${safeFixed(analysis.finalFlow)} g/s`, color:'#475569' },
-            { text:`Rampa inicial: ${safeFixed(analysis.rampSlope)} g/s² • Tiempo a 90% pico: ${analysis.rampTime>0?`${analysis.rampTime.toFixed(1)} s`:'—'}`, color:'#475569' },
-            { text:analysis.hydraulicSummary, color:'#0f172a' }
-          ]
+          bars:[
+            { label:'Índice hidráulico', value:analysis.hydraulicScore, max:100, unit:'', decimals:0, color:'#38bdf8' },
+            { label:'Flujo promedio', value:analysis.avgFlow, max:5, unit:' g/s', decimals:2, color:'#60a5fa' },
+            { label:'Pico de flujo', value:analysis.peakFlow, max:5, unit:' g/s', decimals:2, color:'#22d3ee' },
+            { label:'Flujo final', value:analysis.finalFlow, max:5, unit:' g/s', decimals:2, color:'#0ea5e9' },
+            { label:'Rampa inicial', value:analysis.rampSlope, max:5, unit:' g/s²', decimals:2, color:'#0284c7' }
+          ],
+          notes:[`90% pico: ${analysis.rampTime>0?`${analysis.rampTime.toFixed(1)} s`:'—'}`, analysis.hydraulicSummary]
         },
         {
           title:'Índice de canalización',
-          metric:`${safeFixed(analysis.channelingIndex,0)} /100`,
-          details:[
-            { text:`Picos detectados: ${analysis.channelingSpikes} • Máx aceleración: ${safeFixed(analysis.maxAccel)} g/s²`, color:'#475569' },
-            { text:analysis.channelingSummary, color:'#0f172a' }
-          ]
+          bars:[
+            { label:'Canalización', value:analysis.channelingIndex, max:100, unit:'', decimals:0, color:'#f97316' },
+            { label:'Picos', value:analysis.channelingSpikes, max:10, unit:' eventos', decimals:0, color:'#fb923c' },
+            { label:'Aceleración máx', value:analysis.maxAccel, max:6, unit:' g/s²', decimals:2, color:'#fbbf24' }
+          ],
+          notes:[analysis.channelingSummary]
         },
         {
           title:'Distribución del flujo',
-          metric:`Óptimo: ${safeFixed(analysis.flowDistribution.optimal,0)}%`,
-          details:[
-            { text:`Bajo: ${safeFixed(analysis.flowDistribution.low,0)}% • Alto: ${safeFixed(analysis.flowDistribution.high,0)}%`, color:'#475569' },
-            { text:`Preinfusión: ${analysis.preinfusionDuration>0?`${analysis.preinfusionDuration.toFixed(1)} s`:'—'} • Flujo mínimo: ${safeFixed(analysis.minFlow)} g/s`, color:'#475569' },
-            { text:`Rango clásico: ${FLOW_OPTIMAL_MIN}-${FLOW_OPTIMAL_MAX} g/s`, color:'#475569' },
-            { text:analysis.flowDistributionSummary, color:'#0f172a' }
-          ]
+          stacked:{
+            label:`Rango óptimo ${FLOW_OPTIMAL_MIN}-${FLOW_OPTIMAL_MAX} g/s`,
+            segments:[
+              { label:'Bajo', value:analysis.flowDistribution.low, color:'#64748b' },
+              { label:'Óptimo', value:analysis.flowDistribution.optimal, color:'#22c55e' },
+              { label:'Alto', value:analysis.flowDistribution.high, color:'#f97316' }
+            ]
+          },
+          bars:[
+            { label:'Preinfusión', value:analysis.preinfusionDuration>0?analysis.preinfusionDuration:0, max:10, unit:' s', decimals:1, color:'#4ade80' },
+            { label:'Flujo mínimo', value:analysis.minFlow, max:5, unit:' g/s', decimals:2, color:'#2dd4bf' }
+          ],
+          notes:[analysis.flowDistributionSummary]
         },
         {
           title:`Zona segura (${analysis.zoneShort})`,
-          metric:`En zona: ${safeFixed(analysis.zoneCoverage.inside,0)}%`,
-          details:[
-            { text:analysis.zoneLabel, color:'#475569' },
-            analysis.zoneDescription ? { text:analysis.zoneDescription, color:'#64748b' } : null,
-            { text:`Debajo: ${safeFixed(analysis.zoneCoverage.below,0)}% • Encima: ${safeFixed(analysis.zoneCoverage.above,0)}%`, color:'#475569' },
-            { text:`Brecha media: ${safeFixed(analysis.zoneAverageGap)} g/s • Máx brecha: ${safeFixed(analysis.zoneMaxGap)} g/s`, color:'#475569' },
-            { text:analysis.zoneSummary, color:'#0f172a' }
-          ].filter(Boolean)
+          stacked:{
+            label:'Cobertura',
+            segments:[
+              { label:'En zona', value:analysis.zoneCoverage.inside, color:'#22c55e' },
+              { label:'Debajo', value:analysis.zoneCoverage.below, color:'#60a5fa' },
+              { label:'Encima', value:analysis.zoneCoverage.above, color:'#f97316' }
+            ]
+          },
+          bars:[
+            { label:'Brecha media', value:analysis.zoneAverageGap, max:5, unit:' g/s', decimals:2, color:'#86efac' },
+            { label:'Brecha máxima', value:analysis.zoneMaxGap, max:5, unit:' g/s', decimals:2, color:'#bbf7d0' }
+          ],
+          notes:[analysis.zoneLabel, analysis.zoneDescription, analysis.zoneSummary].filter(Boolean)
         }
       ]
 
@@ -1145,7 +1215,7 @@ export default function App(){
       const gap=28
       const cardColumns=2
       const cardWidth=(width - margin*2 - gap*(cardColumns-1))/cardColumns
-      const cardHeight=230
+      const cardHeight=260
       const cardRows=Math.ceil(cards.length/cardColumns)
       const cardsAreaHeight=cardRows*cardHeight + (cardRows-1)*gap
       const panelHeight=headerHeight + cardsAreaHeight
@@ -1211,16 +1281,91 @@ export default function App(){
         ctx.fillStyle='#0f172a'
         ctx.font='bold 20px Arial'
         ctx.fillText(card.title, x+16, y+32)
-        ctx.font='24px Arial'
-        ctx.fillText(card.metric, x+16, y+62)
-        let textY=y+92
-        const maxWidth=cardWidth-32
-        ctx.font='16px Arial'
-        card.details.forEach(detail=>{
-          ctx.fillStyle=detail?.color || '#475569'
-          textY=drawWrappedText(ctx, detail?.text || '', x+16, textY, maxWidth, 20)
-          textY+=6
-        })
+
+        const barAreaX=x+16
+        let cursorY=y+52
+        const trackWidth=cardWidth-32
+        const trackHeight=14
+
+        const drawValue=(label,value,maxValue,color,unit,decimals)=>{
+          const safeValue=Number.isFinite(value)?value:0
+          const safeMax=maxValue>0?maxValue:1
+          const ratio=Math.max(0, Math.min(1, safeValue/safeMax))
+          ctx.font='12px Arial'
+          ctx.fillStyle='#1e293b'
+          ctx.textAlign='left'
+          ctx.fillText(label, barAreaX, cursorY)
+          ctx.fillStyle='rgba(148,163,184,0.25)'
+          const trackY=cursorY+6
+          ctx.fillRect(barAreaX, trackY, trackWidth, trackHeight)
+          ctx.fillStyle=color
+          ctx.fillRect(barAreaX, trackY, trackWidth*ratio, trackHeight)
+          ctx.fillStyle='#0f172a'
+          ctx.textAlign='right'
+          ctx.fillText(`${safeFixed(safeValue, decimals)}${unit}`, barAreaX+trackWidth, cursorY)
+          ctx.textAlign='left'
+          cursorY=trackY+trackHeight+14
+        }
+
+        const drawStacked=(stacked)=>{
+          if(!stacked) return
+          ctx.font='12px Arial'
+          ctx.fillStyle='#1e293b'
+          ctx.textAlign='left'
+          ctx.fillText(stacked.label, barAreaX, cursorY)
+          const trackY=cursorY+6
+          ctx.fillStyle='rgba(148,163,184,0.25)'
+          ctx.fillRect(barAreaX, trackY, trackWidth, trackHeight)
+          const total=stacked.segments.reduce((sum,segment)=>sum+(Number.isFinite(segment.value)?Math.max(segment.value,0):0),0) || 1
+          let offset=barAreaX
+          stacked.segments.forEach(segment=>{
+            const safeValue=Number.isFinite(segment.value)?Math.max(segment.value,0):0
+            const ratio=total>0? safeValue/total : 0
+            const width=trackWidth*ratio
+            ctx.fillStyle=segment.color || '#22c55e'
+            ctx.fillRect(offset, trackY, width, trackHeight)
+            offset+=width
+          })
+          cursorY=trackY+trackHeight+14
+          ctx.font='11px Arial'
+          let legendX=barAreaX
+          let legendY=cursorY+6
+          stacked.segments.forEach(segment=>{
+            const label=`${segment.label} ${safeFixed(segment.value,0)}%`
+            const textWidth=ctx.measureText(label).width
+            if(legendX + textWidth + 20 > barAreaX + trackWidth){
+              legendX=barAreaX
+              legendY+=18
+            }
+            ctx.fillStyle=segment.color || '#22c55e'
+            ctx.fillRect(legendX, legendY-9, 10, 10)
+            ctx.fillStyle='#1e293b'
+            ctx.fillText(label, legendX+14, legendY)
+            legendX+=textWidth+36
+          })
+          cursorY=legendY+18
+        }
+
+        if(card.stacked){
+          drawStacked(card.stacked)
+        }
+
+        if(Array.isArray(card.bars)){
+          card.bars.forEach(bar=>{
+            drawValue(bar.label, bar.value, bar.max, bar.color, bar.unit || '', bar.decimals ?? 0)
+          })
+        }
+
+        if(Array.isArray(card.notes) && card.notes.length){
+          ctx.font='12px Arial'
+          ctx.fillStyle='#475569'
+          const maxWidth=trackWidth
+          card.notes.forEach(note=>{
+            cursorY=drawWrappedText(ctx, note || '', barAreaX, cursorY, maxWidth, 18)
+            cursorY+=6
+          })
+        }
+        ctx.textAlign='left'
       }
 
       cards.forEach((card,idx)=>drawCard(card, idx))
@@ -1552,34 +1697,60 @@ export default function App(){
             </div>
           </div>
           <div className="grid" style={{marginTop:12}}>
-            <div className="card" style={{padding:'16px'}}>
-              <div className="sub">Relación resistencia-flujo</div>
-              <div className="metric-sm">{analysis.hydraulicScore.toFixed(0)} <span className="sub">índice</span></div>
-              <div className="small">Promedio: {analysis.avgFlow.toFixed(2)} g/s • Pico: {analysis.peakFlow.toFixed(2)} g/s • Final: {analysis.finalFlow.toFixed(2)} g/s</div>
-              <div className="small">Rampa inicial: {analysis.rampSlope.toFixed(2)} g/s² • Tiempo a 90% pico: {analysis.rampTime>0?`${analysis.rampTime.toFixed(1)} s`:'—'}</div>
-              <div className="small">{analysis.hydraulicSummary}</div>
+            <div className="card result-card">
+              <div className="result-title">Relación resistencia-flujo</div>
+              <HorizontalMetricBar label="Índice hidráulico" value={analysis.hydraulicScore} max={100} color="#38bdf8" />
+              <HorizontalMetricBar label="Flujo promedio" value={analysis.avgFlow} max={5} unit=" g/s" color="#60a5fa" decimals={2} />
+              <HorizontalMetricBar label="Pico de flujo" value={analysis.peakFlow} max={5} unit=" g/s" color="#22d3ee" decimals={2} />
+              <HorizontalMetricBar label="Flujo final" value={analysis.finalFlow} max={5} unit=" g/s" color="#0ea5e9" decimals={2} />
+              <HorizontalMetricBar label="Rampa inicial" value={analysis.rampSlope} max={5} unit=" g/s²" color="#0284c7" decimals={2} />
+              <div className="result-chips">
+                <span className="result-chip">90% pico: {analysis.rampTime>0?`${analysis.rampTime.toFixed(1)} s`:'—'}</span>
+                <span className="result-chip">{analysis.hydraulicSummary}</span>
+              </div>
             </div>
-            <div className="card" style={{padding:'16px'}}>
-              <div className="sub">Índice de canalización</div>
-              <div className="metric-sm">{analysis.channelingIndex.toFixed(0)} <span className="sub">/100</span></div>
-              <div className="small">Picos detectados: {analysis.channelingSpikes} • Máx aceleración: {analysis.maxAccel.toFixed(2)} g/s²</div>
-              <div className="small">{analysis.channelingSummary}</div>
+            <div className="card result-card">
+              <div className="result-title">Índice de canalización</div>
+              <HorizontalMetricBar label="Canalización" value={analysis.channelingIndex} max={100} color="#f97316" />
+              <HorizontalMetricBar label="Picos" value={analysis.channelingSpikes} max={10} unit=" eventos" color="#fb923c" decimals={0} />
+              <HorizontalMetricBar label="Aceleración máx" value={analysis.maxAccel} max={6} unit=" g/s²" color="#fbbf24" decimals={2} />
+              <div className="result-chips">
+                <span className="result-chip">{analysis.channelingSummary}</span>
+              </div>
             </div>
-            <div className="card" style={{padding:'16px'}}>
-              <div className="sub">Distribución del flujo</div>
-              <div className="small">Preinfusión: {analysis.preinfusionDuration>0?`${analysis.preinfusionDuration.toFixed(1)} s`:'—'} • Flujo mínimo: {analysis.minFlow.toFixed(2)} g/s</div>
-              <div className="small">En rango ({FLOW_OPTIMAL_MIN}-{FLOW_OPTIMAL_MAX} g/s): {analysis.flowDistribution.optimal.toFixed(0)}%</div>
-              <div className="small">Bajo rango: {analysis.flowDistribution.low.toFixed(0)}% • Alto rango: {analysis.flowDistribution.high.toFixed(0)}%</div>
-              <div className="small">{analysis.flowDistributionSummary}</div>
+            <div className="card result-card">
+              <div className="result-title">Distribución del flujo</div>
+              <ResultStackedBar
+                label={`Rango óptimo ${FLOW_OPTIMAL_MIN}-${FLOW_OPTIMAL_MAX} g/s`}
+                segments={[
+                  { key:'low', label:'Bajo', value:analysis.flowDistribution.low, color:'#64748b' },
+                  { key:'opt', label:'Óptimo', value:analysis.flowDistribution.optimal, color:'#22c55e' },
+                  { key:'high', label:'Alto', value:analysis.flowDistribution.high, color:'#f97316' }
+                ]}
+              />
+              <HorizontalMetricBar label="Preinfusión" value={analysis.preinfusionDuration} max={10} unit=" s" color="#4ade80" decimals={1} />
+              <HorizontalMetricBar label="Flujo mínimo" value={analysis.minFlow} max={5} unit=" g/s" color="#2dd4bf" decimals={2} />
+              <div className="result-chips">
+                <span className="result-chip">{analysis.flowDistributionSummary}</span>
+              </div>
             </div>
-            <div className="card" style={{padding:'16px'}}>
-              <div className="sub">Zona segura de caudal ({analysis.zoneShort})</div>
-              <div className="metric-sm">{analysis.zoneCoverage.inside.toFixed(0)} <span className="sub">% en zona</span></div>
-              <div className="small">{analysis.zoneLabel}</div>
-              {analysis.zoneDescription && <div className="small">{analysis.zoneDescription}</div>}
-              <div className="small">Debajo: {analysis.zoneCoverage.below.toFixed(0)}% • Encima: {analysis.zoneCoverage.above.toFixed(0)}%</div>
-              <div className="small">Brecha media: {analysis.zoneAverageGap.toFixed(2)} g/s • Máx brecha: {analysis.zoneMaxGap.toFixed(2)} g/s</div>
-              <div className="small">{analysis.zoneSummary}</div>
+            <div className="card result-card">
+              <div className="result-title">Zona segura ({analysis.zoneShort})</div>
+              <ResultStackedBar
+                label="Cobertura"
+                segments={[
+                  { key:'inside', label:'En zona', value:analysis.zoneCoverage.inside, color:'#22c55e' },
+                  { key:'below', label:'Debajo', value:analysis.zoneCoverage.below, color:'#60a5fa' },
+                  { key:'above', label:'Encima', value:analysis.zoneCoverage.above, color:'#f97316' }
+                ]}
+              />
+              <HorizontalMetricBar label="Brecha media" value={analysis.zoneAverageGap} max={5} unit=" g/s" color="#86efac" decimals={2} />
+              <HorizontalMetricBar label="Brecha máxima" value={analysis.zoneMaxGap} max={5} unit=" g/s" color="#bbf7d0" decimals={2} />
+              <div className="result-chips">
+                <span className="result-chip">{analysis.zoneLabel}</span>
+                {analysis.zoneDescription && <span className="result-chip subtle">{analysis.zoneDescription}</span>}
+                <span className="result-chip">{analysis.zoneSummary}</span>
+              </div>
             </div>
           </div>
         </div>
