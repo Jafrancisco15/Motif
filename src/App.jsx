@@ -72,6 +72,122 @@ const interpolateZone = (nodes, progress) => {
   return { min: last.min ?? 0, max: last.max ?? 0 }
 }
 
+const randomBetween = (min, max) => min + (max - min) * Math.random()
+
+function generateSimulatedExtraction(mode='optimal'){
+  const dt=0.25
+  const totalSteps=Math.max(96, Math.round(randomBetween(24, 32)/dt))
+  const totalDuration=Number((totalSteps*dt).toFixed(2))
+  const preinfusionSteps=Math.min(totalSteps-12, Math.max(8, Math.round(randomBetween(3.5, 6.5)/dt)))
+  const pattern=mode==='optimal' ? 'balanced' : (Math.random()>0.5 ? 'high' : 'low')
+
+  const samples=[{t:0, g:0, flow:0}]
+  let weight=0
+  let extractionStart=null
+  let extractionStop=null
+  let lowFlowStart=null
+
+  for(let step=1; step<=totalSteps; step++){
+    const time=Number((step*dt).toFixed(3))
+    let flow=0
+    if(step<=preinfusionSteps){
+      const progress=step/preinfusionSteps
+      flow=randomBetween(0.02,0.12)*progress
+    }else{
+      const progress=Math.min(1, (step-preinfusionSteps)/Math.max(totalSteps-preinfusionSteps,1))
+      if(mode==='optimal'){
+        const startFlow=randomBetween(0.6,0.9)
+        const peakFlow=randomBetween(1.6,2.05)
+        const sustainFlow=randomBetween(1.4,1.75)
+        const finishFlow=randomBetween(0.8,1.2)
+        if(progress<0.3){
+          const local=progress/0.3
+          flow=startFlow + (peakFlow-startFlow)*local
+        }else if(progress<0.75){
+          const local=(progress-0.3)/0.45
+          flow=peakFlow + (sustainFlow-peakFlow)*local
+        }else{
+          const local=(progress-0.75)/0.25
+          flow=sustainFlow + (finishFlow-sustainFlow)*local
+        }
+        flow+=randomBetween(-0.12,0.12)
+      }else if(pattern==='high'){
+        const startFlow=randomBetween(1.2,1.8)
+        const peakFlow=randomBetween(3.6,4.4)
+        const finishFlow=randomBetween(2.6,3.4)
+        if(progress<0.25){
+          const local=progress/0.25
+          flow=startFlow + (peakFlow-startFlow)*local
+        }else{
+          const local=(progress-0.25)/0.75
+          flow=peakFlow + (finishFlow-peakFlow)*local
+        }
+        if(Math.random()<0.3){
+          const spikeCenter=randomBetween(0.35,0.7)
+          const width=0.08
+          const spikeFactor=Math.max(0, 1-Math.abs(progress-spikeCenter)/width)
+          flow+=spikeFactor*randomBetween(1.0,1.8)
+        }
+        flow+=randomBetween(-0.15,0.15)
+      }else{
+        const startFlow=randomBetween(0.25,0.5)
+        const peakFlow=randomBetween(0.75,1.1)
+        const finishFlow=randomBetween(0.25,0.55)
+        if(progress<0.45){
+          const local=progress/0.45
+          flow=startFlow + (peakFlow-startFlow)*local
+        }else{
+          const local=(progress-0.45)/0.55
+          flow=peakFlow + (finishFlow-peakFlow)*local
+        }
+        if(Math.random()<0.35){
+          const dipCenter=randomBetween(0.55,0.85)
+          const width=0.1
+          const dipFactor=Math.max(0, 1-Math.abs(progress-dipCenter)/width)
+          flow-=dipFactor*randomBetween(0.2,0.5)
+        }
+        flow+=randomBetween(-0.08,0.08)
+      }
+      flow=Math.max(0, flow)
+    }
+
+    weight+=flow*dt
+    const roundedFlow=Number(flow.toFixed(3))
+    const roundedWeight=Number(weight.toFixed(3))
+    samples.push({ t: time, g: roundedWeight, flow: roundedFlow })
+
+    if(roundedWeight>=1 && extractionStart===null){
+      extractionStart=time
+    }
+    if(extractionStart!==null){
+      if(flow<0.2){
+        if(lowFlowStart===null){ lowFlowStart=time }
+        if(extractionStop===null && time-lowFlowStart>=1){
+          extractionStop=time
+        }
+      }else{
+        lowFlowStart=null
+        if(extractionStop!==null){ extractionStop=null }
+      }
+    }
+  }
+
+  const finalSample=samples[samples.length-1] || { t: totalDuration, g: Number(weight.toFixed(3)), flow:0 }
+  if(extractionStart!==null && extractionStop===null){
+    extractionStop=finalSample.t
+  }
+  const extractionDuration=extractionStart!==null ? Math.max(0, Number(((extractionStop - extractionStart)||0).toFixed(2))) : 0
+  const label = mode==='optimal' ? 'en rango' : (pattern==='high' ? 'flujo alto' : 'flujo bajo')
+
+  return {
+    samples,
+    totalDuration: finalSample.t,
+    extractionDuration,
+    finalWeight: finalSample.g,
+    profileLabel: label
+  }
+}
+
 function median(values){
   if(!values.length) return 0
   const sorted=[...values].sort((a,b)=>a-b)
@@ -138,6 +254,7 @@ export default function App(){
   const [running,setRunning]=useState(false)
   const [elapsed,setElapsed]=useState(0)
   const [extractionInfo,setExtractionInfo]=useState({active:false,duration:0,lastDuration:0})
+  const [simulatorStatus,setSimulatorStatus]=useState('')
 
   const activeZone=useMemo(()=>FLOW_ZONE_PRESETS[zonePreset] || FLOW_ZONE_PRESETS.SINPF,[zonePreset])
 
@@ -484,6 +601,7 @@ export default function App(){
     setElapsed(0)
     extractionRef.current={ baseline:netG, hasBaseline:true, active:false, start:0, lastRiseTime:0, lastRiseWeight:netG }
     setExtractionInfo(prev=>({active:false,duration:0,lastDuration:prev.lastDuration}))
+    setSimulatorStatus('')
   }
 
   async function connect(){
@@ -644,6 +762,7 @@ export default function App(){
     if(!charRef.current) return
     resetRunState()
     setRunning(true)
+    setSimulatorStatus('')
   }
 
   function stop(){
@@ -734,6 +853,7 @@ export default function App(){
     resetRunState()
     setRunning(false)
     runningRef.current=false
+    setSimulatorStatus('')
   }
 
   const chartData=useMemo(()=>{
@@ -1120,10 +1240,32 @@ export default function App(){
   },[running])
 
   useEffect(()=>{
-    if(!running){
+    if(!running && samples.length===0){
       setElapsed(0)
     }
-  },[running])
+  },[running, samples])
+
+  function simulateExtraction(mode){
+    const result=generateSimulatedExtraction(mode)
+    resetFilters()
+    runningRef.current=false
+    setRunning(false)
+    startTimeRef.current=null
+    lastCapturedRef.current=null
+    extractionRef.current={ baseline:0, hasBaseline:true, active:false, start:0, lastRiseTime:0, lastRiseWeight:0 }
+    flowRef.current={ time:null, net:result.finalWeight }
+    setSamples(result.samples)
+    setAbsG(Number(result.finalWeight.toFixed(2)))
+    setNetG(Number(result.finalWeight.toFixed(2)))
+    setFlowGps(0)
+    setElapsed(Number(result.totalDuration.toFixed(2)))
+    setExtractionInfo({active:false,duration:0,lastDuration:result.extractionDuration})
+    setTareApplied(true)
+    setTareValueG(0)
+    setTareTime(new Date().toISOString())
+    setErrorMsg('')
+    setSimulatorStatus(`Simulación ${mode==='optimal'?'en rango':`fuera de rango (${result.profileLabel})`} lista`)
+  }
 
   return (
     <div className="container">
@@ -1136,7 +1278,17 @@ export default function App(){
               <div className="sub">Mentor Coffee Scale • Web Bluetooth</div>
             </div>
           </div>
-          <span className="pill">{connected?`Conectado${deviceName?` a ${deviceName}`:''}`:'Desconectado'}</span>
+          <div className="row" style={{gap:12,alignItems:'flex-end',justifyContent:'flex-end'}}>
+            <div className="simulator-box">
+              <div className="sim-label">Simulador</div>
+              <div className="row" style={{gap:6,flexWrap:'nowrap'}}>
+                <button onClick={()=>simulateExtraction('optimal')} disabled={running||connecting||connected} title={connected?'Desconecta la balanza para simular.':''}>En rango</button>
+                <button onClick={()=>simulateExtraction('off')} disabled={running||connecting||connected} title={connected?'Desconecta la balanza para simular.':''}>Fuera de rango</button>
+              </div>
+              {simulatorStatus && <div className="sim-status">{simulatorStatus}</div>}
+            </div>
+            <span className="pill">{connected?`Conectado${deviceName?` a ${deviceName}`:''}`:'Desconectado'}</span>
+          </div>
         </div>
 
         <div className="row" style={{marginBottom:16}}>
