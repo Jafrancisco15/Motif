@@ -14,6 +14,8 @@ const FLOW_OPTIMAL_MIN = 1.5
 const FLOW_OPTIMAL_MAX = 3.5
 const PREINFUSION_THRESHOLD = 0.5
 
+const LATENCY_SAMPLE_MIN_INTERVAL_MS = 120
+
 const FLOW_ZONE_SOURCES = {
   SINPF: {
     id: 'SINPF',
@@ -401,6 +403,7 @@ export default function App(){
   const lastCapturedRef=useRef(null)
   const flowRef=useRef({time:null,net:0})
   const smoothRef=useRef({ net:[], abs:[], durationMs:300, skipUntil:0 })
+  const latencyRef=useRef({ buffer:[], lastProcessed:0 })
   const stabilityRef=useRef({
     net:[],
     abs:[],
@@ -423,6 +426,8 @@ export default function App(){
     smoothRef.current.net=[]
     smoothRef.current.abs=[]
     smoothRef.current.skipUntil=0
+    latencyRef.current.buffer=[]
+    latencyRef.current.lastProcessed=0
     const state=stabilityRef.current
     state.net=[]
     state.abs=[]
@@ -805,19 +810,32 @@ export default function App(){
     const onNotify=(event)=>{
       const dv=new DataView(event.target.value.buffer)
       const raw=decodeRawMg(dv)
-      const now=performance.now()
+      const eventTime=performance.now()
 
       const scaleValue=scaleRef.current || scale
       const zeroValue=zeroRawRef.current || zeroRaw
       const abs=raw*scaleValue
       const net=(raw-zeroValue)*scaleValue
 
+      const latencyState=latencyRef.current
+      latencyState.buffer.push({ time:eventTime, net, abs })
+      if(latencyState.lastProcessed && eventTime - latencyState.lastProcessed < LATENCY_SAMPLE_MIN_INTERVAL_MS){
+        return
+      }
+      const buffered=latencyState.buffer.length ? latencyState.buffer : [{ time:eventTime, net, abs }]
+      const bufferCount=buffered.length
+      const now=buffered.reduce((acc,item)=>acc+item.time,0)/bufferCount
+      const filteredNet=buffered.reduce((acc,item)=>acc+item.net,0)/bufferCount
+      const filteredAbs=buffered.reduce((acc,item)=>acc+item.abs,0)/bufferCount
+      latencyState.buffer=[]
+      latencyState.lastProcessed=eventTime
+
       if(smoothRef.current.skipUntil && now < smoothRef.current.skipUntil){
         return
       }
 
-      smoothRef.current.net.push({t:now,value:net})
-      smoothRef.current.abs.push({t:now,value:abs})
+      smoothRef.current.net.push({t:now,value:filteredNet})
+      smoothRef.current.abs.push({t:now,value:filteredAbs})
       const cutoff=now - smoothRef.current.durationMs
       while(smoothRef.current.net.length && smoothRef.current.net[0].t<cutoff){ smoothRef.current.net.shift() }
       while(smoothRef.current.abs.length && smoothRef.current.abs[0].t<cutoff){ smoothRef.current.abs.shift() }
@@ -1074,6 +1092,7 @@ export default function App(){
           fill:false,
           borderColor:'rgba(242,153,74,1)',
           backgroundColor:'rgba(242,153,74,0.25)',
+          borderWidth:1.5,
           tension:0.25,
           pointRadius:0,
         },
