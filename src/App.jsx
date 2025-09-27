@@ -356,6 +356,7 @@ export default function App(){
   const extractionRef=useRef({ baseline:0, hasBaseline:false, active:false, start:0, lastRiseTime:0, lastRiseWeight:0 })
   const runningRef=useRef(false)
   const chartRef=useRef(null)
+  const importInputRef=useRef(null)
 
   useEffect(()=>{ runningRef.current=running },[running])
 
@@ -444,6 +445,8 @@ export default function App(){
         minFlow:0,
         rampSlope:0,
         preinfusionIndex:0,
+        extractionDuration:0,
+        totalDuration:0,
         zoneGuide:[],
         zoneCoverage:{inside:0,below:0,above:0},
         zoneAverageGap:0,
@@ -493,6 +496,8 @@ export default function App(){
         minFlow:0,
         rampSlope:0,
         preinfusionIndex:preIndex,
+        extractionDuration:0,
+        totalDuration:Math.max(0,totalDuration),
         zoneGuide:[],
         zoneCoverage:{inside:0,below:0,above:0},
         zoneAverageGap:0,
@@ -660,6 +665,8 @@ export default function App(){
       minFlow:isFinite(minFlow)?minFlow:0,
       rampSlope:isFinite(rampSlope)?rampSlope:0,
       preinfusionIndex:preIndex,
+      extractionDuration:Math.max(0, activeDuration),
+      totalDuration:Math.max(0, totalDuration),
       zoneGuide,
       zoneCoverage,
       zoneAverageGap:isFinite(zoneAverageGap)?zoneAverageGap:0,
@@ -1239,9 +1246,39 @@ export default function App(){
   }
 
   function downloadResults(){
+    const series=samples.map(sample=>({
+      t:Number.isFinite(sample?.t)?Number(sample.t.toFixed(3)):0,
+      g:Number.isFinite(sample?.g)?Number(sample.g.toFixed(3)):0,
+      flow:Number.isFinite(sample?.flow)?Number(sample.flow.toFixed(3)):0
+    }))
+    const lastSeries=series[series.length-1] || { t:0, g:0, flow:0 }
+    const serializedZoneGuide=(analysis.zoneGuide||[]).map(entry=>({
+      t:Number.isFinite(entry?.t)?Number(entry.t.toFixed(3)):0,
+      min:Number.isFinite(entry?.min)?Number(entry.min.toFixed(3)):0,
+      max:Number.isFinite(entry?.max)?Number(entry.max.toFixed(3)):0
+    }))
+    const extractionDuration=analysis?.extractionDuration ?? (extractionInfo.active ? extractionInfo.duration : extractionInfo.lastDuration)
     const payload={
       generatedAt:new Date().toISOString(),
-      samples:samples.length,
+      runtime:{
+        elapsed:Number.isFinite(elapsed)?Number(elapsed.toFixed(2)):0,
+        extractionDuration:Number.isFinite(extractionDuration)?Number(extractionDuration.toFixed(2)):0,
+        tare:{
+          applied:!!tareApplied,
+          value:Number.isFinite(tareValueG)?Number(tareValueG.toFixed(3)):0,
+          timestamp:tareTime
+        },
+        lastSample:{
+          t:lastSeries.t,
+          netG:lastSeries.g,
+          absG:Number.isFinite(absG)?Number(absG.toFixed(3)):lastSeries.g,
+          flowGps:lastSeries.flow
+        }
+      },
+      samples:{
+        count:samples.length,
+        series
+      },
       metrics:{
         preinfusionDuration:analysis.preinfusionDuration,
         avgFlow:analysis.avgFlow,
@@ -1256,6 +1293,8 @@ export default function App(){
         rampTime:analysis.rampTime,
         rampSlope:analysis.rampSlope,
         minFlow:analysis.minFlow,
+        extractionDuration:analysis.extractionDuration,
+        totalDuration:analysis.totalDuration,
         safeFlowRange:[FLOW_OPTIMAL_MIN,FLOW_OPTIMAL_MAX],
         preinfusionThreshold:PREINFUSION_THRESHOLD,
         zoneCoverage:analysis.zoneCoverage,
@@ -1272,7 +1311,7 @@ export default function App(){
           { progress:point.progress, min:point.min, max:point.max }
         ))
       },
-      zoneGuide:analysis.zoneGuide,
+      zoneGuide:serializedZoneGuide,
       narratives:{
         hydraulic:analysis.hydraulicSummary,
         channeling:analysis.channelingSummary,
@@ -1287,6 +1326,95 @@ export default function App(){
     a.download='espresso_results.json'
     a.click()
     URL.revokeObjectURL(url)
+  }
+
+  function triggerImportResults(){
+    if(importInputRef.current){
+      importInputRef.current.value=''
+      importInputRef.current.click()
+    }
+  }
+
+  async function handleImportResults(event){
+    const file=event.target?.files?.[0]
+    if(!file) return
+    try{
+      const text=await file.text()
+      const parsed=JSON.parse(text)
+      const seriesSource=Array.isArray(parsed?.samples?.series)?parsed.samples.series:
+        Array.isArray(parsed?.series)?parsed.series:
+        Array.isArray(parsed?.sampleSeries)?parsed.sampleSeries:
+        (Array.isArray(parsed?.samples)&&parsed.samples.length&&typeof parsed.samples[0]==='object'?parsed.samples:[])
+      const sanitized=seriesSource.map(item=>{
+        const t=parseNumber(item?.t ?? item?.time ?? item?.seconds ?? item?.timestamp)
+        const g=parseNumber(item?.g ?? item?.net ?? item?.netG ?? item?.weight ?? item?.value)
+        const flowValue=parseNumber(item?.flow ?? item?.flowGps ?? item?.f ?? item?.rate)
+        return Number.isFinite(t) && Number.isFinite(g) ? {
+          t,
+          g,
+          flow:Number.isFinite(flowValue)?flowValue:null
+        } : null
+      }).filter(Boolean)
+      if(!sanitized.length){
+        throw new Error('El archivo no contiene muestras válidas.')
+      }
+      const sorted=sanitized.sort((a,b)=>a.t-b.t)
+      let previous=null
+      for(const sample of sorted){
+        if(!Number.isFinite(sample.flow) && previous){
+          const dt=Math.max(1e-3, sample.t-previous.t)
+          sample.flow=(sample.g-previous.g)/dt
+        }
+        if(!Number.isFinite(sample.flow)){
+          sample.flow=0
+        }
+        sample.t=Number(sample.t.toFixed(3))
+        sample.g=Number(sample.g.toFixed(3))
+        sample.flow=Number(sample.flow.toFixed(3))
+        previous=sample
+      }
+      const finalSample=sorted[sorted.length-1]
+      const runtime=parsed?.runtime || {}
+      const tareMeta=runtime?.tare || {}
+      const zoneId=parsed?.metrics?.zonePresetId || parsed?.zonePreset?.id
+      const importElapsedValue=parseNumber(runtime?.elapsed)
+      const importExtractionValue=Number.isFinite(runtime?.extractionDuration)?Number(runtime.extractionDuration):parseNumber(parsed?.metrics?.extractionDuration)
+      const importAbsValue=parseNumber(runtime?.lastSample?.absG ?? runtime?.absoluteWeight)
+      const importFlowValue=parseNumber(runtime?.lastSample?.flowGps ?? runtime?.flow)
+      const tareValueValue=parseNumber(tareMeta?.value)
+      const importElapsed=Number.isFinite(importElapsedValue)?importElapsedValue:finalSample.t
+      const importExtraction=Number.isFinite(importExtractionValue)?importExtractionValue:null
+
+      resetFilters()
+      runningRef.current=false
+      setRunning(false)
+      startTimeRef.current=null
+      lastCapturedRef.current=null
+      flowRef.current={ time:null, net:finalSample.g }
+      extractionRef.current={ baseline:finalSample.g, hasBaseline:true, active:false, start:0, lastRiseTime:performance.now(), lastRiseWeight:finalSample.g }
+
+      setSamples(sorted)
+      setNetG(Number(finalSample.g.toFixed(2)))
+      const resolvedAbs=Number.isFinite(importAbsValue)?importAbsValue:finalSample.g
+      const resolvedFlow=Number.isFinite(importFlowValue)?importFlowValue:finalSample.flow
+      setAbsG(Number(resolvedAbs.toFixed(2)))
+      setFlowGps(Number(resolvedFlow.toFixed(3)))
+      setElapsed(Number(importElapsed.toFixed(2)))
+      setExtractionInfo({active:false,duration:0,lastDuration:Number.isFinite(importExtraction)?Number(importExtraction.toFixed(2)):0})
+      setTareApplied(Boolean(tareMeta?.applied))
+      setTareValueG(Number.isFinite(tareValueValue)?Number(tareValueValue.toFixed(2)):0)
+      setTareTime(tareMeta?.timestamp || null)
+      if(zoneId && FLOW_ZONE_PRESETS[zoneId]){
+        setZonePreset(zoneId)
+      }
+      setSimulatorStatus('Datos importados para visualización')
+      setErrorMsg('')
+    }catch(err){
+      console.error('No se pudo importar datos', err)
+      alert(`No se pudo importar el archivo: ${err?.message || err}`)
+    }finally{
+      if(event?.target){ event.target.value='' }
+    }
   }
 
   function formatTime(seconds, decimals=0){
@@ -1352,6 +1480,7 @@ export default function App(){
 
   return (
     <div className="container">
+      <input ref={importInputRef} type="file" accept="application/json" style={{display:'none'}} onChange={handleImportResults} />
       <div className="card">
         <div className="row" style={{justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
           <div className="row" style={{alignItems:'center',gap:12}}>
@@ -1417,6 +1546,7 @@ export default function App(){
               </div>
             </div>
             <div className="row" style={{gap:8,flexWrap:'wrap'}}>
+              <button onClick={triggerImportResults}>Importar datos (JSON)</button>
               <button onClick={downloadPanelComposite} disabled={samples.length===0}>Exportar panel + gráfico</button>
               <button onClick={downloadResults} disabled={samples.length===0}>Exportar datos (JSON)</button>
             </div>
