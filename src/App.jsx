@@ -21,11 +21,12 @@ const FLOW_ZONE_PRESETS = {
     description: 'Envelope recomendado para extracciones directas sin etapa de preinfusión prolongada.',
     nodes: [
       { progress: 0, min: 0, max: 0 },
-      { progress: 0.17, min: 0.6, max: 3.0 },
-      { progress: 0.33, min: 1.4, max: 3.4 },
-      { progress: 0.5, min: 1.3, max: 3.1 },
-      { progress: 0.67, min: 1.2, max: 2.7 },
-      { progress: 1, min: 0.9, max: 2.1 }
+      { progress: 0.17, min: 2.9, max: 3.4 },
+      { progress: 0.33, min: 2.6, max: 3.2 },
+      { progress: 0.5, min: 2.3, max: 3.0 },
+      { progress: 0.67, min: 2.0, max: 2.7 },
+      { progress: 0.83, min: 1.6, max: 2.4 },
+      { progress: 1, min: 1.1, max: 2.1 }
     ]
   },
   CONPF: {
@@ -36,11 +37,12 @@ const FLOW_ZONE_PRESETS = {
     description: 'Envelope recomendado cuando se aplica preinfusión antes del flujo principal.',
     nodes: [
       { progress: 0, min: 0, max: 0 },
-      { progress: 0.17, min: 0.3, max: 1.2 },
-      { progress: 0.33, min: 0.8, max: 2.1 },
-      { progress: 0.5, min: 1.0, max: 2.3 },
-      { progress: 0.67, min: 1.1, max: 2.2 },
-      { progress: 1, min: 1.0, max: 2.0 }
+      { progress: 0.17, min: 0.4, max: 1.1 },
+      { progress: 0.33, min: 1.0, max: 2.0 },
+      { progress: 0.5, min: 1.5, max: 2.3 },
+      { progress: 0.67, min: 1.7, max: 2.2 },
+      { progress: 0.83, min: 1.6, max: 2.0 },
+      { progress: 1, min: 1.4, max: 1.8 }
     ]
   }
 }
