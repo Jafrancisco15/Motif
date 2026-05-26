@@ -1,0 +1,24 @@
+segment,label,progress,min,max
+S1,Banda primaria,0,0,0
+S1,Banda primaria,0.08,1.0,1.6
+S1,Banda primaria,0.18,1.4,1.9
+S1,Banda primaria,0.32,1.6,2.1
+S1,Banda primaria,0.48,1.5,2.0
+S1,Banda primaria,0.65,1.3,1.8
+S1,Banda primaria,0.82,1.1,1.5
+S1,Banda primaria,1,0.9,1.3
+S2,Banda superior,0,0,0
+S2,Banda superior,0.12,2.6,3.2
+S2,Banda superior,0.28,2.5,3.1
+S2,Banda superior,0.42,2.3,2.9
+S2,Banda superior,0.58,2.0,2.6
+S2,Banda superior,0.74,1.7,2.3
+S2,Banda superior,0.9,1.3,1.9
+S2,Banda superior,1,0.8,1.4
+S3,Banda de transición,0,0,0
+S3,Banda de transición,0.22,2.0,2.4
+S3,Banda de transición,0.36,1.8,2.2
+S3,Banda de transición,0.52,1.5,1.9
+S3,Banda de transición,0.68,1.2,1.6
+S3,Banda de transición,0.82,0.9,1.3
+S3,Banda de transición,1,0,0
