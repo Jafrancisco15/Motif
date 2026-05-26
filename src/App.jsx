@@ -324,6 +324,63 @@ function generateSimulatedExtraction(mode='optimal'){
   }
 }
 
+function simulateFromUserInputs(config){
+  const targetWeight = Math.max(1, Number(config?.targetWeight) || 36)
+  const extractionTime = Math.max(8, Number(config?.extractionTime) || 28)
+  const firstDropTime = clamp(Number(config?.firstDropTime) || 6, 0.5, Math.max(1, extractionTime - 1))
+  const hasPreinfusion = Boolean(config?.hasPreinfusion)
+  const dose = Math.max(1, Number(config?.dose) || 18)
+  const tds = Number.isFinite(Number(config?.tds)) ? Number(config.tds) : null
+  const dt = 0.25
+  const totalSteps = Math.max(8, Math.round(extractionTime / dt))
+  const preinfusionEnd = hasPreinfusion ? Math.min(totalSteps - 2, Math.round((firstDropTime * 0.75) / dt)) : 0
+  const dropStartStep = Math.min(totalSteps - 1, Math.max(preinfusionEnd + 1, Math.round(firstDropTime / dt)))
+  const activeSteps = Math.max(1, totalSteps - dropStartStep + 1)
+  const baseFlow = targetWeight / Math.max(1e-6, activeSteps * dt)
+  const concentrationBias = tds !== null ? clamp((tds - 9) / 5, -0.25, 0.25) : 0
+  const brewRatio = targetWeight / Math.max(1, dose)
+
+  const samples = [{ t: 0, g: 0, flow: 0 }]
+  let weight = 0
+  for(let step = 1; step <= totalSteps; step++){
+    const t = Number((step * dt).toFixed(3))
+    let flow = 0
+    if(step < dropStartStep){
+      if(hasPreinfusion){
+        const local = step / Math.max(1, dropStartStep)
+        flow = randomBetween(0.01, 0.08) * local
+      }else{
+        flow = randomBetween(0, 0.03)
+      }
+    }else{
+      const p = (step - dropStartStep) / Math.max(1, activeSteps - 1)
+      const ramp = p < 0.3 ? (0.55 + p * 1.6) : (p < 0.75 ? 1.03 - ((p - 0.3) * 0.22) : 0.92 - ((p - 0.75) * 0.95))
+      const ratioBias = brewRatio > 2.3 ? 0.12 : (brewRatio < 1.8 ? -0.12 : 0)
+      flow = baseFlow * (ramp + concentrationBias + ratioBias) + randomBetween(-0.06, 0.06)
+      flow = Math.max(0, flow)
+    }
+    weight += flow * dt
+    samples.push({ t, g: Number(weight.toFixed(3)), flow: Number(flow.toFixed(3)) })
+  }
+
+  const produced = samples[samples.length - 1]?.g || 0
+  const correction = targetWeight / Math.max(1e-6, produced)
+  const normalized = samples.map((sample, i) => {
+    const g = Number((sample.g * correction).toFixed(3))
+    const prev = i > 0 ? samples[i - 1] : null
+    const prevG = i > 0 ? Number((prev.g * correction).toFixed(3)) : 0
+    const flow = i > 0 ? Number((((g - prevG) / Math.max(1e-3, sample.t - prev.t))).toFixed(3)) : 0
+    return { t: sample.t, g, flow: Math.max(0, flow) }
+  })
+
+  return {
+    samples: normalized,
+    totalDuration: Number((totalSteps * dt).toFixed(2)),
+    extractionDuration: Number(Math.max(0, extractionTime - firstDropTime).toFixed(2)),
+    finalWeight: Number(targetWeight.toFixed(2))
+  }
+}
+
 function median(values){
   if(!values.length) return 0
   const sorted=[...values].sort((a,b)=>a-b)
@@ -391,6 +448,14 @@ export default function App(){
   const [elapsed,setElapsed]=useState(0)
   const [extractionInfo,setExtractionInfo]=useState({active:false,duration:0,lastDuration:0})
   const [simulatorStatus,setSimulatorStatus]=useState('')
+  const [simInputs,setSimInputs]=useState({
+    targetWeight:36,
+    extractionTime:28,
+    firstDropTime:6,
+    hasPreinfusion:true,
+    tds:'',
+    dose:18
+  })
 
   const activeZone=useMemo(()=>FLOW_ZONE_PRESETS[zonePreset] || FLOW_ZONE_PRESETS.SINPF,[zonePreset])
 
@@ -1642,6 +1707,32 @@ export default function App(){
     setSimulatorStatus(`Simulación ${mode==='optimal'?'en rango':`fuera de rango (${result.profileLabel})`} lista`)
   }
 
+  function runCustomSimulation(){
+    const parsedTds = simInputs.tds === '' ? null : parseNumber(simInputs.tds)
+    const result = simulateFromUserInputs({
+      ...simInputs,
+      tds: parsedTds
+    })
+    resetFilters()
+    runningRef.current=false
+    setRunning(false)
+    startTimeRef.current=null
+    lastCapturedRef.current=null
+    extractionRef.current={ baseline:0, hasBaseline:true, active:false, start:0, lastRiseTime:0, lastRiseWeight:0 }
+    flowRef.current={ time:null, net:result.finalWeight }
+    setSamples(result.samples)
+    setAbsG(Number(result.finalWeight.toFixed(2)))
+    setNetG(Number(result.finalWeight.toFixed(2)))
+    setFlowGps(0)
+    setElapsed(Number(result.totalDuration.toFixed(2)))
+    setExtractionInfo({active:false,duration:0,lastDuration:result.extractionDuration})
+    setTareApplied(true)
+    setTareValueG(0)
+    setTareTime(new Date().toISOString())
+    setErrorMsg('')
+    setSimulatorStatus('Simulación personalizada lista')
+  }
+
   return (
     <div className="container">
       <input ref={importInputRef} type="file" accept="application/json" style={{display:'none'}} onChange={handleImportResults} />
@@ -1661,6 +1752,15 @@ export default function App(){
                 <button onClick={()=>simulateExtraction('optimal')} disabled={running||connecting||connected} title={connected?'Desconecta la balanza para simular.':''}>En rango</button>
                 <button onClick={()=>simulateExtraction('off')} disabled={running||connecting||connected} title={connected?'Desconecta la balanza para simular.':''}>Fuera de rango</button>
               </div>
+              <div className="sim-grid">
+                <label>Peso bebida (g)<input type="number" min="1" step="0.1" value={simInputs.targetWeight} onChange={e=>setSimInputs(prev=>({...prev,targetWeight:e.target.value}))} /></label>
+                <label>Tiempo total (s)<input type="number" min="8" step="0.1" value={simInputs.extractionTime} onChange={e=>setSimInputs(prev=>({...prev,extractionTime:e.target.value}))} /></label>
+                <label>Primera gota (s)<input type="number" min="0.5" step="0.1" value={simInputs.firstDropTime} onChange={e=>setSimInputs(prev=>({...prev,firstDropTime:e.target.value}))} /></label>
+                <label>Dosis café (g)<input type="number" min="1" step="0.1" value={simInputs.dose} onChange={e=>setSimInputs(prev=>({...prev,dose:e.target.value}))} /></label>
+                <label>TDS (%)<input type="number" min="0" step="0.1" value={simInputs.tds} onChange={e=>setSimInputs(prev=>({...prev,tds:e.target.value}))} /></label>
+                <label className="sim-check"><input type="checkbox" checked={simInputs.hasPreinfusion} onChange={e=>setSimInputs(prev=>({...prev,hasPreinfusion:e.target.checked}))} />Preinfusión</label>
+              </div>
+              <button onClick={runCustomSimulation} disabled={running||connecting||connected} title={connected?'Desconecta la balanza para simular.':''}>Simular con datos</button>
               {simulatorStatus && <div className="sim-status">{simulatorStatus}</div>}
             </div>
             <span className="pill">{connected?`Conectado${deviceName?` a ${deviceName}`:''}`:'Desconectado'}</span>
@@ -1808,4 +1908,3 @@ export default function App(){
     </div>
   )
 }
-
