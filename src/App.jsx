@@ -1,135 +1,1056 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Line } from 'react-chartjs-2'
 import { Chart, LineElement, PointElement, LinearScale, TimeScale, Tooltip, Legend, Filler, CategoryScale } from 'chart.js'
+import zoneSinpfCsv from '../values/flow_zone_sinpf.csv?raw'
+import zoneConpfCsv from '../values/flow_zone_conpf.csv?raw'
+import logo from './logo.svg'
 
 Chart.register(LineElement, PointElement, LinearScale, TimeScale, Tooltip, Legend, Filler, CategoryScale)
 
 const DEFAULT_SERVICE = '1bc50001-0200-0aa5-e311-24cb004a98c5'
 const DEFAULT_CHAR = '1bc50002-0200-0aa5-e311-24cb004a98c5'
 
+const FLOW_OPTIMAL_MIN = 1.5
+const FLOW_OPTIMAL_MAX = 3.5
+const PREINFUSION_THRESHOLD = 0.5
+
+const LATENCY_SAMPLE_MIN_INTERVAL_MS = 120
+
+const FLOW_ZONE_SOURCES = {
+  SINPF: {
+    id: 'SINPF',
+    label: 'Zona segura sin preinfusión',
+    shortLabel: 'sin preinfusión',
+    optionLabel: 'SIN preinfusión (SINPF)',
+    description: 'Envelope recomendado para extracciones directas sin etapa de preinfusión prolongada.',
+    csv: zoneSinpfCsv
+  },
+  CONPF: {
+    id: 'CONPF',
+    label: 'Zona segura con preinfusión',
+    shortLabel: 'con preinfusión',
+    optionLabel: 'CON preinfusión (CONPF)',
+    description: 'Envelope recomendado cuando se aplica preinfusión antes del flujo principal.',
+    csv: zoneConpfCsv
+  }
+}
+
+const parseNumber = (value) => {
+  if(value === undefined || value === null) return null
+  const normalized = String(value).trim().replace(/\s+/g, '')
+  if(!normalized){ return null }
+  const parsed = Number.parseFloat(normalized.replace(',', '.'))
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
+
+const interpolateNodes = (nodes, progress) => {
+  if(!nodes || !nodes.length){
+    return null
+  }
+  if(!Number.isFinite(progress)){
+    const first = nodes[0]
+    return { min: first.min ?? 0, max: first.max ?? 0 }
+  }
+  const sorted = [...nodes].sort((a,b)=>a.progress-b.progress)
+  const start = sorted[0]
+  const end = sorted[sorted.length-1]
+  const clampedProgress = clamp(progress, start.progress, end.progress)
+  for(let i=0;i<sorted.length-1;i++){
+    const current = sorted[i]
+    const next = sorted[i+1]
+    if(clampedProgress <= next.progress){
+      const denom = Math.max(1e-6, next.progress - current.progress)
+      const span = clamp((clampedProgress - current.progress) / denom, 0, 1)
+      return {
+        min: (current.min ?? 0) + ((next.min ?? 0) - (current.min ?? 0)) * span,
+        max: (current.max ?? 0) + ((next.max ?? 0) - (current.max ?? 0)) * span
+      }
+    }
+  }
+  return { min: end.min ?? 0, max: end.max ?? 0 }
+}
+
+const parseZoneCsv = (rawCsv) => {
+  if(!rawCsv){
+    return { segments: [], envelope: [] }
+  }
+  const lines = String(rawCsv)
+    .split(/\r?\n/)
+    .map(line=>line.trim())
+    .filter(line=>line && !line.startsWith('#'))
+  if(!lines.length){
+    return { segments: [], envelope: [] }
+  }
+  const header = lines[0].split(',').map(cell=>cell.trim().toLowerCase())
+  const idxSegment = header.indexOf('segment')
+  const idxLabel = header.indexOf('label')
+  const idxProgress = header.indexOf('progress')
+  const idxMin = header.indexOf('min')
+  const idxMax = header.indexOf('max')
+  const segmentsMap = new Map()
+
+  for(let i=1;i<lines.length;i++){
+    const cells = lines[i].split(',')
+    const segmentId = idxSegment>=0 ? (cells[idxSegment]||'segment') : 'segment'
+    const label = idxLabel>=0 ? (cells[idxLabel]||'') : ''
+    const progress = idxProgress>=0 ? parseNumber(cells[idxProgress]) : null
+    const min = idxMin>=0 ? parseNumber(cells[idxMin]) : null
+    const max = idxMax>=0 ? parseNumber(cells[idxMax]) : null
+    if(!Number.isFinite(progress) || !Number.isFinite(min) || !Number.isFinite(max)){
+      continue
+    }
+    if(!segmentsMap.has(segmentId)){
+      segmentsMap.set(segmentId, { id: segmentId, label: label || '', nodes: [] })
+    }
+    const segment = segmentsMap.get(segmentId)
+    if(label && !segment.label){ segment.label = label }
+    segment.nodes.push({ progress, min, max })
+  }
+
+  const segments = Array.from(segmentsMap.values()).map(segment=>({
+    ...segment,
+    nodes: segment.nodes.sort((a,b)=>a.progress-b.progress)
+  })).filter(segment=>segment.nodes.length)
+
+  const progressPoints = Array.from(new Set(segments.flatMap(segment=>segment.nodes.map(node=>node.progress))))
+    .sort((a,b)=>a-b)
+
+  const envelope = progressPoints.map(progress=>{
+    const ranges = segments
+      .map(segment=>{
+        const range = interpolateNodes(segment.nodes, progress)
+        return range ? { ...range, segmentId: segment.id, label: segment.label } : null
+      })
+      .filter(Boolean)
+    if(!ranges.length){
+      return { progress, min:0, max:0, ranges:[] }
+    }
+    return {
+      progress,
+      min: Math.min(...ranges.map(range=>range.min)),
+      max: Math.max(...ranges.map(range=>range.max)),
+      ranges
+    }
+  })
+
+  return { segments, envelope }
+}
+
+const FLOW_ZONE_PRESETS = Object.fromEntries(
+  Object.entries(FLOW_ZONE_SOURCES).map(([id, meta])=>{
+    const parsed = parseZoneCsv(meta.csv)
+    return [
+      id,
+      {
+        ...meta,
+        nodes: parsed.envelope.map(({ progress, min, max })=>({ progress, min, max })),
+        envelope: parsed.envelope
+      }
+    ]
+  })
+)
+
+const randomBetween = (min, max) => min + (max - min) * Math.random()
+
+const formatNumber = (value, decimals = 0) => Number.isFinite(value) ? value.toFixed(decimals) : '—'
+
+function HorizontalMetricBar({ label, value, max = 100, unit = '', color = '#38bdf8', decimals = 0 }){
+  const safeValue = Number.isFinite(value) ? value : 0
+  const safeMax = max > 0 ? max : 1
+  const ratio = clamp(safeValue / safeMax, 0, 1)
+  return (
+    <div className="result-bar">
+      <div className="result-bar-header">
+        <span className="result-bar-label">{label}</span>
+        <span className="result-bar-value">{formatNumber(safeValue, decimals)}{unit}</span>
+      </div>
+      <div className="result-bar-track">
+        <div className="result-bar-fill" style={{width:`${ratio*100}%`, background:color}} />
+      </div>
+    </div>
+  )
+}
+
+function ResultStackedBar({ label, segments = [], unit = '%' }){
+  const total = segments.reduce((sum, segment)=> sum + (Number.isFinite(segment.value) ? Math.max(segment.value,0) : 0), 0)
+  const safeTotal = total > 0 ? total : segments.reduce((sum, segment)=> sum + (segment.fallback || 0), 0) || 1
+  return (
+    <div className="result-stacked">
+      <div className="result-bar-header">
+        <span className="result-bar-label">{label}</span>
+        <span className="result-bar-value">{segments.map(segment=>`${segment.label} ${formatNumber(segment.value||0,0)}${unit}`).join(' • ')}</span>
+      </div>
+      <div className="result-stacked-track">
+        {segments.map(segment=>{
+          const safeValue = Number.isFinite(segment.value) ? Math.max(segment.value,0) : 0
+          const ratio = safeValue / safeTotal
+          return (
+            <div
+              key={segment.key || segment.label}
+              className="result-stacked-segment"
+              style={{
+                width:`${Math.max(0, Math.min(1, ratio))*100}%`,
+                background:segment.color || '#38bdf8'
+              }}
+            />
+          )
+        })}
+      </div>
+      <div className="result-legend">
+        {segments.map(segment=>(
+          <div key={`legend-${segment.key || segment.label}`} className="legend-item">
+            <span className="legend-dot" style={{background:segment.color || '#38bdf8'}} />
+            <span className="legend-label">{segment.label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function generateSimulatedExtraction(mode='optimal'){
+  const dt=0.25
+  const totalSteps=Math.max(96, Math.round(randomBetween(24, 32)/dt))
+  const totalDuration=Number((totalSteps*dt).toFixed(2))
+  const preinfusionSteps=Math.min(totalSteps-12, Math.max(8, Math.round(randomBetween(3.5, 6.5)/dt)))
+  const pattern=mode==='optimal' ? 'balanced' : (Math.random()>0.5 ? 'high' : 'low')
+
+  const samples=[{t:0, g:0, flow:0}]
+  let weight=0
+  let extractionStart=null
+  let extractionStop=null
+  let lowFlowStart=null
+
+  for(let step=1; step<=totalSteps; step++){
+    const time=Number((step*dt).toFixed(3))
+    let flow=0
+    if(step<=preinfusionSteps){
+      const progress=step/preinfusionSteps
+      flow=randomBetween(0.02,0.12)*progress
+    }else{
+      const progress=Math.min(1, (step-preinfusionSteps)/Math.max(totalSteps-preinfusionSteps,1))
+      if(mode==='optimal'){
+        const startFlow=randomBetween(0.6,0.9)
+        const peakFlow=randomBetween(1.6,2.05)
+        const sustainFlow=randomBetween(1.4,1.75)
+        const finishFlow=randomBetween(0.8,1.2)
+        if(progress<0.3){
+          const local=progress/0.3
+          flow=startFlow + (peakFlow-startFlow)*local
+        }else if(progress<0.75){
+          const local=(progress-0.3)/0.45
+          flow=peakFlow + (sustainFlow-peakFlow)*local
+        }else{
+          const local=(progress-0.75)/0.25
+          flow=sustainFlow + (finishFlow-sustainFlow)*local
+        }
+        flow+=randomBetween(-0.12,0.12)
+      }else if(pattern==='high'){
+        const startFlow=randomBetween(1.2,1.8)
+        const peakFlow=randomBetween(3.6,4.4)
+        const finishFlow=randomBetween(2.6,3.4)
+        if(progress<0.25){
+          const local=progress/0.25
+          flow=startFlow + (peakFlow-startFlow)*local
+        }else{
+          const local=(progress-0.25)/0.75
+          flow=peakFlow + (finishFlow-peakFlow)*local
+        }
+        if(Math.random()<0.3){
+          const spikeCenter=randomBetween(0.35,0.7)
+          const width=0.08
+          const spikeFactor=Math.max(0, 1-Math.abs(progress-spikeCenter)/width)
+          flow+=spikeFactor*randomBetween(1.0,1.8)
+        }
+        flow+=randomBetween(-0.15,0.15)
+      }else{
+        const startFlow=randomBetween(0.25,0.5)
+        const peakFlow=randomBetween(0.75,1.1)
+        const finishFlow=randomBetween(0.25,0.55)
+        if(progress<0.45){
+          const local=progress/0.45
+          flow=startFlow + (peakFlow-startFlow)*local
+        }else{
+          const local=(progress-0.45)/0.55
+          flow=peakFlow + (finishFlow-peakFlow)*local
+        }
+        if(Math.random()<0.35){
+          const dipCenter=randomBetween(0.55,0.85)
+          const width=0.1
+          const dipFactor=Math.max(0, 1-Math.abs(progress-dipCenter)/width)
+          flow-=dipFactor*randomBetween(0.2,0.5)
+        }
+        flow+=randomBetween(-0.08,0.08)
+      }
+      flow=Math.max(0, flow)
+    }
+
+    weight+=flow*dt
+    const roundedFlow=Number(flow.toFixed(3))
+    const roundedWeight=Number(weight.toFixed(3))
+    samples.push({ t: time, g: roundedWeight, flow: roundedFlow })
+
+    if(roundedWeight>=1 && extractionStart===null){
+      extractionStart=time
+    }
+    if(extractionStart!==null){
+      if(flow<0.2){
+        if(lowFlowStart===null){ lowFlowStart=time }
+        if(extractionStop===null && time-lowFlowStart>=1){
+          extractionStop=time
+        }
+      }else{
+        lowFlowStart=null
+        if(extractionStop!==null){ extractionStop=null }
+      }
+    }
+  }
+
+  const finalSample=samples[samples.length-1] || { t: totalDuration, g: Number(weight.toFixed(3)), flow:0 }
+  if(extractionStart!==null && extractionStop===null){
+    extractionStop=finalSample.t
+  }
+  const extractionDuration=extractionStart!==null ? Math.max(0, Number(((extractionStop - extractionStart)||0).toFixed(2))) : 0
+  const label = mode==='optimal' ? 'en rango' : (pattern==='high' ? 'flujo alto' : 'flujo bajo')
+
+  return {
+    samples,
+    totalDuration: finalSample.t,
+    extractionDuration,
+    finalWeight: finalSample.g,
+    profileLabel: label
+  }
+}
+
+function simulateFromUserInputs(config){
+  const targetWeight = Math.max(1, Number(config?.targetWeight) || 36)
+  const extractionTime = Math.max(8, Number(config?.extractionTime) || 28)
+  const firstDropTime = clamp(Number(config?.firstDropTime) || 6, 0.5, Math.max(1, extractionTime - 1))
+  const hasPreinfusion = Boolean(config?.hasPreinfusion)
+  const dose = Math.max(1, Number(config?.dose) || 18)
+  const tds = Number.isFinite(Number(config?.tds)) ? Number(config.tds) : null
+  const dt = 0.25
+  const totalSteps = Math.max(8, Math.round(extractionTime / dt))
+  const preinfusionEnd = hasPreinfusion ? Math.min(totalSteps - 2, Math.round((firstDropTime * 0.75) / dt)) : 0
+  const dropStartStep = Math.min(totalSteps - 1, Math.max(preinfusionEnd + 1, Math.round(firstDropTime / dt)))
+  const activeSteps = Math.max(1, totalSteps - dropStartStep + 1)
+  const baseFlow = targetWeight / Math.max(1e-6, activeSteps * dt)
+  const concentrationBias = tds !== null ? clamp((tds - 9) / 5, -0.25, 0.25) : 0
+  const brewRatio = targetWeight / Math.max(1, dose)
+
+  const samples = [{ t: 0, g: 0, flow: 0 }]
+  let weight = 0
+  for(let step = 1; step <= totalSteps; step++){
+    const t = Number((step * dt).toFixed(3))
+    let flow = 0
+    if(step < dropStartStep){
+      if(hasPreinfusion){
+        const local = step / Math.max(1, dropStartStep)
+        flow = randomBetween(0.01, 0.08) * local
+      }else{
+        flow = randomBetween(0, 0.03)
+      }
+    }else{
+      const p = (step - dropStartStep) / Math.max(1, activeSteps - 1)
+      const ramp = p < 0.3 ? (0.55 + p * 1.6) : (p < 0.75 ? 1.03 - ((p - 0.3) * 0.22) : 0.92 - ((p - 0.75) * 0.95))
+      const ratioBias = brewRatio > 2.3 ? 0.12 : (brewRatio < 1.8 ? -0.12 : 0)
+      flow = baseFlow * (ramp + concentrationBias + ratioBias) + randomBetween(-0.06, 0.06)
+      flow = Math.max(0, flow)
+    }
+    weight += flow * dt
+    samples.push({ t, g: Number(weight.toFixed(3)), flow: Number(flow.toFixed(3)) })
+  }
+
+  const produced = samples[samples.length - 1]?.g || 0
+  const correction = targetWeight / Math.max(1e-6, produced)
+  const normalized = samples.map((sample, i) => {
+    const g = Number((sample.g * correction).toFixed(3))
+    const prev = i > 0 ? samples[i - 1] : null
+    const prevG = i > 0 ? Number((prev.g * correction).toFixed(3)) : 0
+    const flow = i > 0 ? Number((((g - prevG) / Math.max(1e-3, sample.t - prev.t))).toFixed(3)) : 0
+    return { t: sample.t, g, flow: Math.max(0, flow) }
+  })
+
+  return {
+    samples: normalized,
+    totalDuration: Number((totalSteps * dt).toFixed(2)),
+    extractionDuration: Number(Math.max(0, extractionTime - firstDropTime).toFixed(2)),
+    finalWeight: Number(targetWeight.toFixed(2))
+  }
+}
+
+function median(values){
+  if(!values.length) return 0
+  const sorted=[...values].sort((a,b)=>a-b)
+  const mid=Math.floor(sorted.length/2)
+  return sorted.length%2? sorted[mid] : (sorted[mid-1]+sorted[mid])/2
+}
+
+function mad(values, med){
+  if(!values.length) return 0
+  const diffs=values.map(v=>Math.abs(v-(med??median(values))))
+  return median(diffs)
+}
+
+function correlation(xs, ys){
+  const n=Math.min(xs.length, ys.length)
+  if(n<2) return 0
+  let sumX=0,sumY=0
+  for(let i=0;i<n;i++){ sumX+=xs[i]; sumY+=ys[i] }
+  const meanX=sumX/n, meanY=sumY/n
+  let cov=0, varX=0, varY=0
+  for(let i=0;i<n;i++){
+    const dx=xs[i]-meanX
+    const dy=ys[i]-meanY
+    cov+=dx*dy
+    varX+=dx*dx
+    varY+=dy*dy
+  }
+  const denom=Math.sqrt(varX*varY)
+  return denom? clamp(cov/denom, -1, 1) : 0
+}
+
 function decodeRawMg(dv){ return dv.getInt32(0,true) }
 
-function useLocalStorage(key, initial) {
-  const [state, setState] = useState(() => {
-    try {
-      const v = localStorage.getItem(key)
-      return v !== null ? JSON.parse(v) : initial
-    } catch { return initial }
+function useLocalStorage(key, initial){
+  const [state, setState]=useState(()=>{
+    try{
+      const v=localStorage.getItem(key)
+      return v!==null? JSON.parse(v) : initial
+    }catch{ return initial }
   })
-  useEffect(() => { try { localStorage.setItem(key, JSON.stringify(state)) } catch {} }, [key, state])
+  useEffect(()=>{ try{ localStorage.setItem(key, JSON.stringify(state)) }catch{} },[key,state])
   return [state, setState]
 }
 
 export default function App(){
-  const [serviceUUID,setServiceUUID]=useState(DEFAULT_SERVICE)
-  const [charUUID,setCharUUID]=useState(DEFAULT_CHAR)
-  const [acceptAll,setAcceptAll]=useState(true)
+  const [activeView,setActiveView]=useState('tracker')
   const [connected,setConnected]=useState(false)
   const [connecting,setConnecting]=useState(false)
   const [deviceName,setDeviceName]=useState('')
   const [errorMsg,setErrorMsg]=useState('')
 
-  // Calibration profiles
   const [profiles,setProfiles]=useLocalStorage('mentor.profiles', {})
   const [currentProfile,setCurrentProfile]=useLocalStorage('mentor.currentProfile', 'default')
   const [scale,setScale]=useLocalStorage(`mentor.${currentProfile}.scale`, 0.001)
   const [zeroRaw,setZeroRaw]=useLocalStorage(`mentor.${currentProfile}.zeroRaw`, 0)
+  const [zonePreset,setZonePreset]=useLocalStorage('mentor.flowZonePreset', 'SINPF')
   const [tareApplied,setTareApplied]=useState(false)
   const [tareValueG,setTareValueG]=useState(0)
   const [tareTime,setTareTime]=useState(null)
 
-  // Readouts
-  const [absG,setAbsG]=useState(0) // before tare
-  const [netG,setNetG]=useState(0) // after tare
+  const [absG,setAbsG]=useState(0)
+  const [netG,setNetG]=useState(0)
   const [flowGps,setFlowGps]=useState(0)
   const [samples,setSamples]=useState([])
   const [running,setRunning]=useState(false)
+  const [elapsed,setElapsed]=useState(0)
+  const [extractionInfo,setExtractionInfo]=useState({active:false,duration:0,lastDuration:0})
+  const [simulatorStatus,setSimulatorStatus]=useState('')
+  const [simInputs,setSimInputs]=useState({
+    targetWeight:36,
+    extractionTime:28,
+    firstDropTime:6,
+    hasPreinfusion:true,
+    tds:'',
+    dose:18
+  })
 
-  const charRef=useRef(null), deviceRef=useRef(null)
-  const startTimeRef=useRef(null), lastSampleRef=useRef(null)
-  const smoothRef=useRef({ buffer:[], durationMs:300, baseRaw:null })
+  const activeZone=useMemo(()=>FLOW_ZONE_PRESETS[zonePreset] || FLOW_ZONE_PRESETS.SINPF,[zonePreset])
+
+  const scaleRef=useRef(scale)
+  const zeroRawRef=useRef(zeroRaw)
+  const charRef=useRef(null)
+  const deviceRef=useRef(null)
+  const notifyHandlerRef=useRef(null)
+  const startTimeRef=useRef(null)
+  const lastCapturedRef=useRef(null)
+  const flowRef=useRef({time:null,net:0})
+  const smoothRef=useRef({ net:[], abs:[], durationMs:300, skipUntil:0 })
+  const latencyRef=useRef({ buffer:[], lastProcessed:0 })
+  const stabilityRef=useRef({
+    net:[],
+    abs:[],
+    holdNet:null,
+    holdAbs:null,
+    durationMs:1800,
+    releaseThreshold:0.15
+  })
+  const extractionRef=useRef({ baseline:0, hasBaseline:false, active:false, start:0, lastRiseTime:0, lastRiseWeight:0 })
+  const runningRef=useRef(false)
+  const chartRef=useRef(null)
+  const importInputRef=useRef(null)
+
+  useEffect(()=>{ runningRef.current=running },[running])
+
+  useEffect(()=>{ scaleRef.current=scale },[scale])
+  useEffect(()=>{ zeroRawRef.current=zeroRaw },[zeroRaw])
+
+  function resetFilters(){
+    smoothRef.current.net=[]
+    smoothRef.current.abs=[]
+    smoothRef.current.skipUntil=0
+    latencyRef.current.buffer=[]
+    latencyRef.current.lastProcessed=0
+    const state=stabilityRef.current
+    state.net=[]
+    state.abs=[]
+    state.holdNet=null
+    state.holdAbs=null
+  }
+
+  function stabilizeValue(channel, value, now){
+    const state=stabilityRef.current
+    const buffer=channel==='net'?state.net:state.abs
+    const holdKey=channel==='net'?'holdNet':'holdAbs'
+    buffer.push({t:now,value})
+    const cutoff=now-state.durationMs
+    while(buffer.length && buffer[0].t<cutoff){ buffer.shift() }
+    if(buffer.length){
+      let min=buffer[0].value
+      let max=buffer[0].value
+      const values=buffer.map(item=>{
+        if(item.value<min){ min=item.value }
+        if(item.value>max){ max=item.value }
+        return item.value
+      })
+      const med=median(values)
+      const deviation=mad(values, med)
+      const range=max-min
+      if(values.length>=6 && deviation<=0.003 && range<=0.03 && Math.abs(value-med)<=0.05){
+        state[holdKey]=med
+      }else if(state[holdKey]!==null){
+        if(Math.abs(value-state[holdKey])>state.releaseThreshold || range>0.08){
+          state[holdKey]=null
+        }
+      }
+      if(state[holdKey]!==null){
+        return state[holdKey]
+      }
+    }
+    return value
+  }
 
   useEffect(()=>{
-    // When profile changes, rebind scale/zero from localStorage
-    const s = JSON.parse(localStorage.getItem(`mentor.${currentProfile}.scale`)||'0.001')
-    const z = JSON.parse(localStorage.getItem(`mentor.${currentProfile}.zeroRaw`)||'0')
-    setScale(s||0.001); setZeroRaw(z||0)
-  }, [currentProfile])
+    const storedScale=JSON.parse(localStorage.getItem(`mentor.${currentProfile}.scale`)||'0.001')
+    const storedZero=JSON.parse(localStorage.getItem(`mentor.${currentProfile}.zeroRaw`)||'0')
+    setScale(storedScale||0.001)
+    setZeroRaw(storedZero||0)
+    setTareApplied(false)
+    setTareValueG(0)
+    setTareTime(null)
+  },[currentProfile])
 
-  const onDisconnect=()=>{ setConnected(false); setRunning(false); charRef.current=null; deviceRef.current=null }
+  const analysis=useMemo(()=>{
+    const zoneConfig=activeZone || FLOW_ZONE_PRESETS.SINPF
+    const zoneNodes=zoneConfig?.nodes || []
+    const zoneMeta={
+      id: zoneConfig?.id || 'SINPF',
+      label: zoneConfig?.label || 'Zona segura',
+      short: zoneConfig?.shortLabel || 'sin preinfusión',
+      description: zoneConfig?.description || ''
+    }
+
+    if(samples.length<3){
+      return {
+        preinfusionDuration:0,
+        avgFlow:0,
+        peakFlow:0,
+        hydraulicScore:0,
+        hydraulicSummary:'Sin datos suficientes para analizar la relación resistencia-flujo.',
+        flowCorrelation:0,
+        channelingIndex:0,
+        channelingSpikes:0,
+        channelingSummary:'',
+        maxAccel:0,
+        flowDistribution:{optimal:0,low:0,high:0},
+        flowDistributionSummary:'',
+        rampTime:0,
+        finalFlow:0,
+        minFlow:0,
+        rampSlope:0,
+        preinfusionIndex:0,
+        extractionDuration:0,
+        totalDuration:0,
+        zoneGuide:[],
+        zoneCoverage:{inside:0,below:0,above:0},
+        zoneAverageGap:0,
+        zoneMaxGap:0,
+        zoneSummary:`Sin datos suficientes para comparar con la zona ${zoneMeta.short}.`,
+        zonePresetId:zoneMeta.id,
+        zoneLabel:zoneMeta.label,
+        zoneShort:zoneMeta.short,
+        zoneDescription:zoneMeta.description
+      }
+    }
+
+    const flows=samples.map(s=>s.flow)
+    const weights=samples.map(s=>s.g)
+    const times=samples.map(s=>s.t)
+
+    const firstTime=times[0]
+    const totalDuration=times[times.length-1]-firstTime
+
+    let preIndex=0
+    for(let i=0;i<flows.length;i++){
+      if(flows[i]>PREINFUSION_THRESHOLD){
+        const window=samples.slice(i, Math.min(i+5, samples.length))
+        const avgWindow=window.reduce((acc,cur)=>acc+cur.flow,0)/window.length
+        if(avgWindow>PREINFUSION_THRESHOLD){ preIndex=i; break }
+      }
+    }
+
+    const preinfusionDuration=times[Math.max(preIndex,0)]-firstTime
+    const activeSamples=samples.slice(preIndex)
+    if(activeSamples.length<2){
+      return {
+        preinfusionDuration:Math.max(0, preinfusionDuration),
+        avgFlow:0,
+        peakFlow:0,
+        hydraulicScore:0,
+        hydraulicSummary:'Sin datos suficientes después de la preinfusión.',
+        flowCorrelation:0,
+        channelingIndex:0,
+        channelingSpikes:0,
+        channelingSummary:'',
+        maxAccel:0,
+        flowDistribution:{optimal:0,low:0,high:0},
+        flowDistributionSummary:'',
+        rampTime:0,
+        finalFlow:0,
+        minFlow:0,
+        rampSlope:0,
+        preinfusionIndex:preIndex,
+        extractionDuration:0,
+        totalDuration:Math.max(0,totalDuration),
+        zoneGuide:[],
+        zoneCoverage:{inside:0,below:0,above:0},
+        zoneAverageGap:0,
+        zoneMaxGap:0,
+        zoneSummary:`Sin datos suficientes para comparar con la zona ${zoneMeta.short}.`,
+        zonePresetId:zoneMeta.id,
+        zoneLabel:zoneMeta.label,
+        zoneShort:zoneMeta.short,
+        zoneDescription:zoneMeta.description
+      }
+    }
+
+    const activeFlows=activeSamples.map(s=>s.flow)
+    const activeWeights=activeSamples.map(s=>s.g)
+    const activeTimes=activeSamples.map(s=>s.t)
+    const activeDuration=activeTimes[activeTimes.length-1]-activeTimes[0]
+
+    const avgFlow=activeFlows.reduce((acc,v)=>acc+v,0)/activeFlows.length
+    const peakFlow=Math.max(...activeFlows.map(v=>isFinite(v)?v:0))
+    const minFlow=Math.min(...activeFlows.map(v=>isFinite(v)?v:0))
+
+    const rampWindowEnd=activeTimes[0]+Math.min(4, Math.max(1, activeDuration))
+    const rampSlice=activeSamples.filter(s=>s.t<=rampWindowEnd)
+    const rampSlope=rampSlice.length>1 ? (rampSlice[rampSlice.length-1].flow - rampSlice[0].flow)/Math.max(0.25, rampSlice[rampSlice.length-1].t-rampSlice[0].t) : 0
+
+    const finalWindowStart=activeTimes[activeTimes.length-1]-Math.min(1.5, Math.max(0.5, activeDuration/3))
+    const finalSlice=activeSamples.filter(s=>s.t>=finalWindowStart)
+    const finalFlow=finalSlice.length? finalSlice.reduce((acc,s)=>acc+s.flow,0)/finalSlice.length : activeFlows[activeFlows.length-1]
+
+    const hydraulicRatio=peakFlow? avgFlow/peakFlow : 0
+    const hydraulicScore=Math.round(clamp((1-hydraulicRatio)*100,0,100))
+    const correlationFlowWeight=correlation(activeWeights, activeFlows)
+
+    let hydraulicSummary
+    if(hydraulicScore>70){ hydraulicSummary='Resistencia muy alta: el flujo promedio es muy inferior al pico medido.' }
+    else if(hydraulicScore>45){ hydraulicSummary='Resistencia elevada: el flujo tarda en abrirse, revisa molienda y distribución.' }
+    else if(hydraulicScore>25){ hydraulicSummary='Resistencia moderada: la rampa de flujo es suave y consistente.' }
+    else { hydraulicSummary='Resistencia baja: el flujo es ágil; vigila que no se sobre-extraiga.' }
+    hydraulicSummary+=` Correlación flujo-peso: ${correlationFlowWeight.toFixed(2)}.`
+
+    const flowMedian=median(activeFlows)
+    const flowMad=mad(activeFlows, flowMedian)
+    let spikeCount=0
+    let maxAccel=0
+    for(let i=1;i<activeSamples.length;i++){
+      const dt=Math.max(0.05, activeSamples[i].t-activeSamples[i-1].t)
+      const accel=(activeSamples[i].flow-activeSamples[i-1].flow)/dt
+      if(Math.abs(accel)>maxAccel) maxAccel=Math.abs(accel)
+      const spikeThreshold=flowMedian + 3*(flowMad||0.12)
+      if(activeSamples[i].flow>spikeThreshold && accel>1){ spikeCount++ }
+    }
+    const channelingIndex=Math.round(clamp((spikeCount/Math.max(1, activeSamples.length-1))*250,0,100))
+    let channelingSummary
+    if(channelingIndex>65){ channelingSummary='Canalización crítica: múltiples picos repentinos de flujo.' }
+    else if(channelingIndex>40){ channelingSummary='Canalización moderada: detectadas aceleraciones puntuales.' }
+    else if(channelingIndex>15){ channelingSummary='Canalización leve: el flujo presenta pequeñas irregularidades.' }
+    else { channelingSummary='Canalización mínima: la curva es uniforme.' }
+
+    let timeOptimal=0, timeLow=0, timeHigh=0
+    for(let i=1;i<activeSamples.length;i++){
+      const dt=Math.max(0, activeSamples[i].t-activeSamples[i-1].t)
+      const flow=activeSamples[i].flow
+      if(flow<FLOW_OPTIMAL_MIN){ timeLow+=dt }
+      else if(flow>FLOW_OPTIMAL_MAX){ timeHigh+=dt }
+      else { timeOptimal+=dt }
+    }
+    const timeTotal=timeOptimal+timeLow+timeHigh || activeDuration || totalDuration || 1
+    const flowDistribution={
+      optimal: clamp((timeOptimal/timeTotal)*100,0,100),
+      low: clamp((timeLow/timeTotal)*100,0,100),
+      high: clamp((timeHigh/timeTotal)*100,0,100)
+    }
+
+    let flowDistributionSummary
+    if(flowDistribution.optimal>60){ flowDistributionSummary='Mayor parte de la extracción dentro del rango clásico de espresso.' }
+    else if(flowDistribution.high>flowDistribution.low){ flowDistributionSummary='Flujo alto predominante: probable sub-extracción o canalización.' }
+    else if(flowDistribution.low>flowDistribution.high){ flowDistributionSummary='Flujo bajo predominante: posible sobre-extracción por alta resistencia.' }
+    else { flowDistributionSummary='Distribución equilibrada pero con variaciones que conviene revisar.' }
+
+    const targetPeak=peakFlow||finalFlow||avgFlow
+    let rampTime=0
+    if(targetPeak>0){
+      for(let i=0;i<activeSamples.length;i++){
+        if(activeSamples[i].flow>=0.9*targetPeak){ rampTime=activeSamples[i].t-activeTimes[0]; break }
+      }
+    }
+
+    const zoneGuide=[]
+    let zoneInside=0
+    let zoneBelow=0
+    let zoneAbove=0
+    let zoneGapWeighted=0
+    let zoneMaxGap=0
+    for(let i=0;i<activeSamples.length;i++){
+      const progress = activeDuration>0 ? (activeSamples[i].t-activeTimes[0]) / Math.max(activeDuration, 1e-6) : 0
+      const envelopeRange = interpolateNodes(zoneNodes, progress) || { min:0, max:0 }
+      zoneGuide.push({
+        t: activeSamples[i].t,
+        min: envelopeRange.min,
+        max: envelopeRange.max
+      })
+      if(i===0) continue
+      const dt=Math.max(0, activeSamples[i].t-activeSamples[i-1].t)
+      const flow=activeSamples[i].flow
+      let classification
+      let gapValue=0
+      if(flow>=envelopeRange.min && flow<=envelopeRange.max){
+        classification='inside'
+      }else if(flow<envelopeRange.min){
+        classification='below'
+        gapValue=envelopeRange.min-flow
+      }else{
+        classification='above'
+        gapValue=flow-envelopeRange.max
+      }
+      if(classification==='inside'){
+        zoneInside+=dt
+      }else if(classification==='below'){
+        zoneBelow+=dt
+      }else if(classification==='above'){
+        zoneAbove+=dt
+      }
+      if(classification!=='inside' && gapValue>0){
+        zoneGapWeighted+=gapValue*dt
+        if(gapValue>zoneMaxGap){ zoneMaxGap=gapValue }
+      }
+    }
+    const zoneTotal=Math.max(zoneInside+zoneBelow+zoneAbove, activeDuration, 1e-6)
+    const zoneCoverage={
+      inside:clamp((zoneInside/zoneTotal)*100,0,100),
+      below:clamp((zoneBelow/zoneTotal)*100,0,100),
+      above:clamp((zoneAbove/zoneTotal)*100,0,100)
+    }
+    const zoneAverageGap=zoneGapWeighted/zoneTotal
+    let zoneNarrative
+    if(zoneCoverage.inside>65){
+      zoneNarrative='Extracción alineada con la zona recomendada durante la mayor parte del tiro.'
+    }else if(zoneCoverage.above>zoneCoverage.below){
+      zoneNarrative='Predominan caudales por encima de la zona; riesgo de sub-extracción o canalización.'
+    }else if(zoneCoverage.below>zoneCoverage.above){
+      zoneNarrative='Predominan caudales por debajo de la zona; posible sobre-extracción por resistencia alta.'
+    }else{
+      zoneNarrative='Flujo alternando entre los límites recomendados; ajusta distribución y molienda.'
+    }
+    if(zoneMaxGap>0.35){
+      zoneNarrative+=` Picos fuera de zona de hasta ${zoneMaxGap.toFixed(2)} g/s.`
+    }
+    const zoneSummary=`Zona ${zoneMeta.short}: ${zoneNarrative}`
+
+    return {
+      preinfusionDuration:Math.max(0, preinfusionDuration),
+      avgFlow:isFinite(avgFlow)?avgFlow:0,
+      peakFlow:isFinite(peakFlow)?peakFlow:0,
+      hydraulicScore,
+      hydraulicSummary,
+      flowCorrelation:correlationFlowWeight,
+      channelingIndex,
+      channelingSpikes:spikeCount,
+      channelingSummary,
+      maxAccel:isFinite(maxAccel)?maxAccel:0,
+      flowDistribution,
+      flowDistributionSummary,
+      rampTime:Math.max(0,rampTime),
+      finalFlow:isFinite(finalFlow)?finalFlow:0,
+      minFlow:isFinite(minFlow)?minFlow:0,
+      rampSlope:isFinite(rampSlope)?rampSlope:0,
+      preinfusionIndex:preIndex,
+      extractionDuration:Math.max(0, activeDuration),
+      totalDuration:Math.max(0, totalDuration),
+      zoneGuide,
+      zoneCoverage,
+      zoneAverageGap:isFinite(zoneAverageGap)?zoneAverageGap:0,
+      zoneMaxGap:isFinite(zoneMaxGap)?zoneMaxGap:0,
+      zoneSummary,
+      zonePresetId:zoneMeta.id,
+      zoneLabel:zoneMeta.label,
+      zoneShort:zoneMeta.short,
+      zoneDescription:zoneMeta.description
+    }
+  },[samples, activeZone])
+
+  useEffect(()=>{ return ()=>{ cleanupNotifications(); try{ deviceRef.current?.gatt?.disconnect() }catch{} } },[])
+
+  function cleanupNotifications(){
+    if(charRef.current && notifyHandlerRef.current){
+      try{ charRef.current.removeEventListener('characteristicvaluechanged', notifyHandlerRef.current) }catch{}
+      try{ charRef.current.stopNotifications() }catch{}
+      notifyHandlerRef.current=null
+    }
+  }
+
+  function resetRunState(){
+    const now=performance.now()
+    resetFilters()
+    startTimeRef.current=now
+    lastCapturedRef.current=null
+    setSamples([])
+    setFlowGps(0)
+    setElapsed(0)
+    extractionRef.current={ baseline:netG, hasBaseline:true, active:false, start:0, lastRiseTime:0, lastRiseWeight:netG }
+    setExtractionInfo(prev=>({active:false,duration:0,lastDuration:prev.lastDuration}))
+    setSimulatorStatus('')
+  }
 
   async function connect(){
     try{
-      setErrorMsg(''); setConnecting(true)
-      let device
-      if(acceptAll){ device=await navigator.bluetooth.requestDevice({ acceptAllDevices:true, optionalServices:[serviceUUID] }) }
-      else { device=await navigator.bluetooth.requestDevice({ filters:[{namePrefix:'MOTIF'},{namePrefix:'Mentor'}], optionalServices:[serviceUUID] }) }
+      setErrorMsg('')
+      setConnecting(true)
+      const device=await navigator.bluetooth.requestDevice({ acceptAllDevices:true, optionalServices:[DEFAULT_SERVICE] })
       deviceRef.current=device
       device.addEventListener('gattserverdisconnected', onDisconnect)
       const server=await device.gatt.connect()
-      const service=await server.getPrimaryService(serviceUUID)
-      const characteristic=await service.getCharacteristic(charUUID)
+      const service=await server.getPrimaryService(DEFAULT_SERVICE)
+      const characteristic=await service.getCharacteristic(DEFAULT_CHAR)
       charRef.current=characteristic
-      setDeviceName(device.name||'—'); setConnected(true)
-    }catch(err){ setErrorMsg(err?.message||String(err)) } finally{ setConnecting(false) }
+      setDeviceName(device.name||'')
+      setConnected(true)
+      await ensureNotifications()
+    }catch(err){
+      onDisconnect()
+      setErrorMsg(err?.message||String(err))
+      try{ deviceRef.current?.gatt?.disconnect() }catch{}
+    }finally{
+      setConnecting(false)
+    }
   }
 
-  async function start(){
-    if(!charRef.current) return
-    setRunning(true); setSamples([]); setFlowGps(0); startTimeRef.current=performance.now(); lastSampleRef.current=null
-    smoothRef.current={buffer:[], durationMs:300, baseRaw:null}
-    setTareApplied(false); setTareValueG(0); setTareTime(null)
+  function onDisconnect(){
+    cleanupNotifications()
+    setConnected(false)
+    setConnecting(false)
+    setDeviceName('')
+    resetFilters()
+    setSamples([])
+    setFlowGps(0)
+    setElapsed(0)
+    setRunning(false)
+    runningRef.current=false
+    setTareApplied(false)
+    setTareValueG(0)
+    setTareTime(null)
+    extractionRef.current={ baseline:0, hasBaseline:false, active:false, start:0, lastRiseTime:0, lastRiseWeight:0 }
+    setExtractionInfo({active:false,duration:0,lastDuration:0})
+  }
+
+  async function ensureNotifications(){
+    if(!charRef.current || notifyHandlerRef.current) return
 
     const onNotify=(event)=>{
       const dv=new DataView(event.target.value.buffer)
       const raw=decodeRawMg(dv)
-      const now=performance.now()
+      const eventTime=performance.now()
 
-      // absolute before tare
-      const abs = raw * scale
-      setAbsG(abs)
+      const scaleValue=scaleRef.current || scale
+      const zeroValue=zeroRawRef.current || zeroRaw
+      const abs=raw*scaleValue
+      const net=(raw-zeroValue)*scaleValue
 
-      // use zeroRaw for tare
-      const net = (raw - zeroRaw) * scale
-      setNetG(net)
+      const latencyState=latencyRef.current
+      latencyState.buffer.push({ time:eventTime, net, abs })
+      if(latencyState.lastProcessed && eventTime - latencyState.lastProcessed < LATENCY_SAMPLE_MIN_INTERVAL_MS){
+        return
+      }
+      const buffered=latencyState.buffer.length ? latencyState.buffer : [{ time:eventTime, net, abs }]
+      const bufferCount=buffered.length
+      const now=buffered.reduce((acc,item)=>acc+item.time,0)/bufferCount
+      const filteredNet=buffered.reduce((acc,item)=>acc+item.net,0)/bufferCount
+      const filteredAbs=buffered.reduce((acc,item)=>acc+item.abs,0)/bufferCount
+      latencyState.buffer=[]
+      latencyState.lastProcessed=eventTime
 
-      if(!tareApplied){
-        setTareApplied(true)
-        setTareValueG(abs)  // what we substract logically as tare (abs at start)
-        setTareTime(new Date().toISOString())
+      if(smoothRef.current.skipUntil && now < smoothRef.current.skipUntil){
+        return
       }
 
-      const t=(now - startTimeRef.current)/1000
-      const last=lastSampleRef.current; let flow=0; if(last){ const dt=Math.max(1e-6, t-last.t); flow=(net-last.g)/dt }
-      lastSampleRef.current={t, g: net}
-      setFlowGps(flow)
-      setSamples(prev=>[...prev,{t, g: net}])
+      smoothRef.current.net.push({t:now,value:filteredNet})
+      smoothRef.current.abs.push({t:now,value:filteredAbs})
+      const cutoff=now - smoothRef.current.durationMs
+      while(smoothRef.current.net.length && smoothRef.current.net[0].t<cutoff){ smoothRef.current.net.shift() }
+      while(smoothRef.current.abs.length && smoothRef.current.abs[0].t<cutoff){ smoothRef.current.abs.shift() }
+      const avg=(arr)=>arr.reduce((acc,item)=>acc+item.value,0)/(arr.length||1)
+      const smoothedNet=avg(smoothRef.current.net)
+      const smoothedAbs=avg(smoothRef.current.abs)
+
+      const prevFlow=flowRef.current
+      if(prevFlow.time!==null){
+        const dt=Math.max(1e-3, (now-prevFlow.time)/1000)
+        const diff=smoothedNet-prevFlow.net
+        const inst=diff/dt
+        if(Math.abs(diff)>8 && Math.abs(inst)>35){
+          smoothRef.current.skipUntil=now+600
+          return
+        }
+      }
+      smoothRef.current.skipUntil=0
+
+      const stableNet=stabilizeValue('net', smoothedNet, now)
+      const stableAbs=stabilizeValue('abs', smoothedAbs, now)
+
+      let instantaneousFlow=0
+      if(prevFlow.time!==null){
+        const dt=Math.max(1e-3, (now-prevFlow.time)/1000)
+        instantaneousFlow=(stableNet-prevFlow.net)/dt
+      }
+
+      setAbsG(stableAbs)
+      setNetG(stableNet)
+      flowRef.current={time:now,net:stableNet}
+      setFlowGps(Number(instantaneousFlow.toFixed(3)))
+
+      if(runningRef.current && startTimeRef.current){
+        const t=(now-startTimeRef.current)/1000
+        const lastCaptured=lastCapturedRef.current
+        let flow=instantaneousFlow
+        if(lastCaptured){
+          const dt=Math.max(1e-3, t-lastCaptured.t)
+          flow=(stableNet-lastCaptured.g)/dt
+        }
+        const roundedFlow=Number(flow.toFixed(3))
+        const newSample={t, g: stableNet, flow: roundedFlow}
+        lastCapturedRef.current=newSample
+        setSamples(prev=>{
+          const next=[...prev, newSample]
+          return next.length>1800? next.slice(next.length-1800) : next
+        })
+
+        const exState=extractionRef.current
+        if(!exState.hasBaseline){
+          exState.baseline=smoothedNet
+          exState.hasBaseline=true
+          exState.lastRiseWeight=smoothedNet
+          exState.lastRiseTime=now
+        }
+        if(!exState.active){
+          if(smoothedNet<exState.baseline){ exState.baseline=smoothedNet }
+          if(smoothedNet - exState.baseline >= 1){
+            exState.active=true
+            exState.start=now
+            exState.lastRiseTime=now
+            exState.lastRiseWeight=smoothedNet
+            setExtractionInfo(prev=>({active:true,duration:0,lastDuration:prev.lastDuration}))
+          }
+        }else{
+          if(smoothedNet - exState.lastRiseWeight >= 1){
+            exState.lastRiseWeight=smoothedNet
+            exState.lastRiseTime=now
+          }
+          const elapsedExtraction=(now-exState.start)/1000
+          const nextDuration=Number(elapsedExtraction.toFixed(2))
+          setExtractionInfo(prev=>{
+            if(!prev.active){ return {active:true,duration:nextDuration,lastDuration:prev.lastDuration} }
+            if(Math.abs(prev.duration-nextDuration)<=0.009){ return prev }
+            return {...prev,duration:nextDuration}
+          })
+          if(now - exState.lastRiseTime > 3000){
+            const finalDuration=Number(((now-exState.start)/1000).toFixed(2))
+            exState.active=false
+            exState.baseline=smoothedNet
+            exState.lastRiseWeight=smoothedNet
+            exState.lastRiseTime=now
+            setExtractionInfo({active:false,duration:0,lastDuration:finalDuration})
+          }
+        }
+      }
     }
 
+    notifyHandlerRef.current=onNotify
     await charRef.current.startNotifications()
     charRef.current.addEventListener('characteristicvaluechanged', onNotify)
   }
 
-  async function stop(){
-    if(charRef.current){
-      try{ await charRef.current.stopNotifications() }catch{}
-      try{ charRef.current.removeEventListener('characteristicvaluechanged', ()=>{}) }catch{}
-    }
-    setRunning(false)
+  function start(){
+    if(!charRef.current) return
+    resetRunState()
+    setRunning(true)
+    setSimulatorStatus('')
   }
 
-  async function disconnect(){ await stop(); try{ deviceRef.current?.gatt?.disconnect() }catch{}; setConnected(false) }
+  function stop(){
+    if(!runningRef.current){
+      setRunning(false)
+      return
+    }
+    const now=performance.now()
+    if(extractionRef.current.active){
+      const finalDuration=Number(((now-extractionRef.current.start)/1000).toFixed(2))
+      setExtractionInfo({active:false,duration:0,lastDuration:finalDuration})
+    }else{
+      setExtractionInfo(prev=>({active:false,duration:0,lastDuration:prev.lastDuration}))
+    }
+    extractionRef.current={ baseline:netG, hasBaseline:true, active:false, start:0, lastRiseTime:0, lastRiseWeight:netG }
+    setRunning(false)
+    runningRef.current=false
+    setElapsed(0)
+    setFlowGps(0)
+    startTimeRef.current=null
+    lastCapturedRef.current=null
+  }
 
-  function zeroNow(){
-    // set zeroRaw from current absolute reading
-    const rawEst=Math.round(absG/scale)
+  async function disconnect(){
+    stop()
+    cleanupNotifications()
+    try{ deviceRef.current?.gatt?.disconnect() }catch{}
+    onDisconnect()
+  }
+
+  function applyTare(){
+    const scaleValue=scaleRef.current || scale
+    const rawEst=scaleValue ? Math.round(absG/scaleValue) : 0
     setZeroRaw(rawEst)
-    setTareApplied(true); setTareValueG(absG); setTareTime(new Date().toISOString())
+    zeroRawRef.current=rawEst
+    setTareApplied(true)
+    setTareValueG(absG)
+    setTareTime(new Date().toISOString())
+    resetFilters()
+    setNetG(0)
+    setFlowGps(0)
+    extractionRef.current={ baseline:0, hasBaseline:true, active:false, start:0, lastRiseTime:performance.now(), lastRiseWeight:0 }
+    flowRef.current={time:null,net:0}
   }
 
   function spanCal(knownG){
-    const rawEst=Math.round(absG/scale)
-    const delta=rawEst - zeroRaw
+    const scaleValue=scaleRef.current || scale
+    const zeroValue=zeroRawRef.current || zeroRaw
+    const rawEst=scaleValue ? Math.round(absG/scaleValue) : 0
+    const delta=rawEst - zeroValue
     if(Math.abs(delta)<1){ alert('Coloca un peso de referencia y vuelve a intentar.'); return }
     const newScale = knownG / delta
     setScale(newScale)
@@ -148,90 +1069,918 @@ export default function App(){
 
   function loadProfile(name){
     if(!name) return
-    const rec = profiles[name]
+    const rec=profiles[name]
     if(rec){
-      setScale(rec.scale); setZeroRaw(rec.zeroRaw); setCurrentProfile(name)
+      setScale(rec.scale)
+      setZeroRaw(rec.zeroRaw)
+      setCurrentProfile(name)
     }
   }
 
   function deleteProfile(name){
     if(!name || name==='default') return
-    const updated={...profiles}; delete updated[name]; setProfiles(updated)
-    localStorage.removeItem(`mentor.${name}.scale`); localStorage.removeItem(`mentor.${name}.zeroRaw`)
-    if(currentProfile===name) setCurrentProfile('default')
+    const updated={...profiles}
+    delete updated[name]
+    setProfiles(updated)
+    localStorage.removeItem(`mentor.${name}.scale`)
+    localStorage.removeItem(`mentor.${name}.zeroRaw`)
+    if(currentProfile===name){ setCurrentProfile('default') }
   }
 
-  const chartData=useMemo(()=>({ labels:samples.map(s=>s.t.toFixed(2)), datasets:[{label:'Peso neto (g)', data:samples.map(s=>s.g), fill:true, tension:0.15}] }),[samples])
-  const chartOptions=useMemo(()=>({ responsive:true, animation:false, plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false}}, scales:{ x:{title:{display:true,text:'Tiempo (s)'},ticks:{maxTicksLimit:8}}, y:{title:{display:true,text:'g'}} } }),[])
+  function resetCurve(){
+    resetRunState()
+    setRunning(false)
+    runningRef.current=false
+    setSimulatorStatus('')
+  }
+
+  const chartData=useMemo(()=>{
+    const labels=samples.map(s=>s.t.toFixed(2))
+    const preIndex=analysis.preinfusionIndex||0
+    const zoneGuide=analysis.zoneGuide||[]
+    const zoneLabel=analysis.zoneShort ? `Zona segura (${analysis.zoneShort})` : 'Zona segura'
+    const zoneDatasets=[]
+    if(zoneGuide.length){
+      const zoneMaxLine=samples.map((_,idx)=>{
+        if(idx<preIndex){ return null }
+        const guide=zoneGuide[idx-preIndex]
+        if(guide && isFinite(guide.max)){ return Number(guide.max.toFixed(3)) }
+        const last=zoneGuide[zoneGuide.length-1]
+        return last && isFinite(last.max)? Number(last.max.toFixed(3)) : null
+      })
+      const zoneMinLine=samples.map((_,idx)=>{
+        if(idx<preIndex){ return null }
+        const guide=zoneGuide[idx-preIndex]
+        if(guide && isFinite(guide.min)){ return Number(guide.min.toFixed(3)) }
+        const last=zoneGuide[zoneGuide.length-1]
+        return last && isFinite(last.min)? Number(last.min.toFixed(3)) : null
+      })
+      zoneDatasets.push({
+        label:zoneLabel,
+        yAxisID:'y1',
+        data:zoneMinLine,
+        borderColor:'rgba(34,197,94,0)',
+        backgroundColor:'rgba(34,197,94,0)',
+        pointRadius:0,
+        tension:0.25,
+        fill:false,
+        skipLegend:true
+      })
+      zoneDatasets.push({
+        label:zoneLabel,
+        yAxisID:'y1',
+        data:zoneMaxLine,
+        borderColor:'rgba(34,197,94,0)',
+        backgroundColor:'rgba(34,197,94,0.22)',
+        pointRadius:0,
+        tension:0.25,
+        borderWidth:0,
+        fill:'-1'
+      })
+    }
+    return {
+      labels,
+      datasets:[
+        {
+          label:'Peso neto (g)',
+          yAxisID:'y',
+          data:samples.map(s=>Number(s.g.toFixed(3))),
+          fill:true,
+          borderColor:'rgba(28,134,238,1)',
+          backgroundColor:'rgba(28,134,238,0.15)',
+          tension:0.2,
+          pointRadius:0,
+        },
+        {
+          label:'Flujo (g/s)',
+          yAxisID:'y1',
+          data:samples.map(s=>s.flow),
+          fill:false,
+          borderColor:'rgba(242,153,74,1)',
+          backgroundColor:'rgba(242,153,74,0.25)',
+          borderWidth:1.5,
+          tension:0.25,
+          pointRadius:0,
+        },
+        ...zoneDatasets
+      ]
+    }
+  },[analysis, samples])
+
+  const chartOptions=useMemo(()=>({
+    responsive:true,
+    maintainAspectRatio:false,
+    animation:false,
+    interaction:{mode:'index',intersect:false},
+    plugins:{
+      legend:{
+        display:true,
+        labels:{
+          usePointStyle:true,
+          filter:(legendItem, data)=>{
+            const dataset=data?.datasets?.[legendItem.datasetIndex]
+            return !dataset?.skipLegend
+          }
+        }
+      },
+      tooltip:{
+        callbacks:{
+          label:(ctx)=>{
+            const value=ctx.parsed.y
+            return `${ctx.dataset.label}: ${value.toFixed(2)} ${ctx.dataset.yAxisID==='y'?'g':'g/s'}`
+          }
+        }
+      }
+    },
+    scales:{
+      x:{title:{display:true,text:'Tiempo (s)'},ticks:{maxTicksLimit:10}},
+      y:{position:'left',title:{display:true,text:'Peso (g)'},grid:{color:'rgba(15,23,42,0.25)'}},
+      y1:{position:'right',title:{display:true,text:'Flujo (g/s)'},grid:{drawOnChartArea:false},ticks:{callback:(value)=>value.toFixed?Number(value).toFixed(1):value}},
+    }
+  }),[])
 
   function downloadCSV(){
-    const header='t_s,peso_neto_g\n'
-    const rows=samples.map(s=>`${s.t.toFixed(3)},${s.g.toFixed(3)}`).join('\n')
+    const header='t_s,peso_neto_g,flujo_gps\n'
+    const rows=samples.map(s=>`${s.t.toFixed(3)},${s.g.toFixed(3)},${s.flow.toFixed(3)}`).join('\n')
     const blob=new Blob([header+rows],{type:'text/csv'})
-    const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='espresso_weight_timeseries.csv'; a.click(); URL.revokeObjectURL(url)
+    const url=URL.createObjectURL(blob)
+    const a=document.createElement('a')
+    a.href=url
+    a.download='espresso_weight_timeseries.csv'
+    a.click()
+    URL.revokeObjectURL(url)
   }
 
-  return (<div className="container"><div className="card">
-    <div className="row" style={{justifyContent:'space-between'}}>
-      <h2 style={{margin:0}}>Mentor Coffee Scale • Web Bluetooth (v4)</h2>
-      <span className="pill">{connected?'Conectado':'Desconectado'}</span>
-    </div>
+  function downloadChartImage(){
+    const chart=chartRef.current
+    const chartInstance=chart && typeof chart.toBase64Image==='function' ? chart : chart?.chartInstance
+    if(!chartInstance || typeof chartInstance.toBase64Image!=='function') return
+    const url=chartInstance.toBase64Image('image/png',1)
+    const a=document.createElement('a')
+    a.href=url
+    a.download='espresso_curve.png'
+    a.click()
+  }
 
-    <div className="row" style={{marginTop:12}}>
-      <input type="text" value={serviceUUID} onChange={e=>setServiceUUID(e.target.value)} style={{flex:'1 1 280px'}} placeholder="Service UUID"/>
-      <input type="text" value={charUUID} onChange={e=>setCharUUID(e.target.value)} style={{flex:'1 1 280px'}} placeholder="Characteristic UUID"/>
-      <label><input type="checkbox" checked={acceptAll} onChange={e=>setAcceptAll(e.target.checked)}/> Mostrar todos</label>
-      <button className="primary" disabled={connecting||connected} onClick={connect}>{connecting?'Escaneando…':'Conectar'}</button>
-      <button onClick={disconnect} disabled={!connected}>Desconectar</button>
-    </div>
+  async function downloadPanelComposite(){
+    if(!samples.length) return
+    const chart=chartRef.current
+    const chartInstance=chart && typeof chart.toBase64Image==='function' ? chart : chart?.chartInstance
+    if(!chartInstance || typeof chartInstance.toBase64Image!=='function') return
+    const chartCanvas=chartInstance.canvas || chartInstance.ctx?.canvas || null
+    try{
+      const chartUrl=chartInstance.toBase64Image('image/png',1)
+      const chartImage=new Image()
+      const loadImage=()=>new Promise((resolve,reject)=>{
+        chartImage.onload=()=>resolve()
+        chartImage.onerror=reject
+      })
+      chartImage.src=chartUrl
+      await loadImage()
 
-    {errorMsg && <div className="error" style={{marginTop:12}}>Error: {errorMsg}</div>}
+      const safeFixed=(value,digits=2)=>Number.isFinite(value)? value.toFixed(digits): (0).toFixed(digits)
+      const cards=[
+        {
+          title:'Relación resistencia-flujo',
+          bars:[
+            { label:'Índice hidráulico', value:analysis.hydraulicScore, max:100, unit:'', decimals:0, color:'#38bdf8' },
+            { label:'Flujo promedio', value:analysis.avgFlow, max:5, unit:' g/s', decimals:2, color:'#60a5fa' },
+            { label:'Pico de flujo', value:analysis.peakFlow, max:5, unit:' g/s', decimals:2, color:'#22d3ee' },
+            { label:'Flujo final', value:analysis.finalFlow, max:5, unit:' g/s', decimals:2, color:'#0ea5e9' },
+            { label:'Rampa inicial', value:analysis.rampSlope, max:5, unit:' g/s²', decimals:2, color:'#0284c7' }
+          ],
+          notes:[`90% pico: ${analysis.rampTime>0?`${analysis.rampTime.toFixed(1)} s`:'—'}`, analysis.hydraulicSummary]
+        },
+        {
+          title:'Índice de canalización',
+          bars:[
+            { label:'Canalización', value:analysis.channelingIndex, max:100, unit:'', decimals:0, color:'#f97316' },
+            { label:'Picos', value:analysis.channelingSpikes, max:10, unit:' eventos', decimals:0, color:'#fb923c' },
+            { label:'Aceleración máx', value:analysis.maxAccel, max:6, unit:' g/s²', decimals:2, color:'#fbbf24' }
+          ],
+          notes:[analysis.channelingSummary]
+        },
+        {
+          title:'Distribución del flujo',
+          stacked:{
+            label:`Rango óptimo ${FLOW_OPTIMAL_MIN}-${FLOW_OPTIMAL_MAX} g/s`,
+            segments:[
+              { label:'Bajo', value:analysis.flowDistribution.low, color:'#64748b' },
+              { label:'Óptimo', value:analysis.flowDistribution.optimal, color:'#22c55e' },
+              { label:'Alto', value:analysis.flowDistribution.high, color:'#f97316' }
+            ]
+          },
+          bars:[
+            { label:'Preinfusión', value:analysis.preinfusionDuration>0?analysis.preinfusionDuration:0, max:10, unit:' s', decimals:1, color:'#4ade80' },
+            { label:'Flujo mínimo', value:analysis.minFlow, max:5, unit:' g/s', decimals:2, color:'#2dd4bf' }
+          ],
+          notes:[analysis.flowDistributionSummary]
+        },
+        {
+          title:`Zona segura (${analysis.zoneShort})`,
+          stacked:{
+            label:'Cobertura',
+            segments:[
+              { label:'En zona', value:analysis.zoneCoverage.inside, color:'#22c55e' },
+              { label:'Debajo', value:analysis.zoneCoverage.below, color:'#60a5fa' },
+              { label:'Encima', value:analysis.zoneCoverage.above, color:'#f97316' }
+            ]
+          },
+          bars:[
+            { label:'Brecha media', value:analysis.zoneAverageGap, max:5, unit:' g/s', decimals:2, color:'#86efac' },
+            { label:'Brecha máxima', value:analysis.zoneMaxGap, max:5, unit:' g/s', decimals:2, color:'#bbf7d0' }
+          ],
+          notes:[analysis.zoneLabel, analysis.zoneDescription, analysis.zoneSummary].filter(Boolean)
+        }
+      ]
 
-    <div className="grid" style={{marginTop:16}}>
-      <div className="card" style={{padding:'16px'}}>
-        <div className="sub">Peso neto (con tare)</div>
-        <div className="metric">{netG.toFixed(2)} <span className="sub">g</span></div>
-        <div className="sub">Flow (dW/dt): {flowGps.toFixed(2)} g/s</div>
-      </div>
-      <div className="card" style={{padding:'16px'}}>
-        <div className="sub">Peso absoluto (antes de tare)</div>
-        <div className="metric-sm">{absG.toFixed(2)} <span className="sub">g</span></div>
-        <div className="sub">Tare aplicado: {tareApplied ? <span className="ok">sí</span> : <span className="warn">no</span>}</div>
-        <div className="sub">Valor de tare: <span className="kbd">{tareValueG.toFixed(2)} g</span> {tareTime && <span className="small">({new Date(tareTime).toLocaleTimeString()})</span>}</div>
-        <div className="sub">zeroRaw: <span className="kbd">{zeroRaw}</span> • scale: <span className="kbd">{scale}</span> g/u • perfil: <span className="kbd">{currentProfile}</span></div>
-      </div>
-    </div>
+      const width=1280
+      const margin=56
+      const headerHeight=130
+      const gap=28
+      const cardColumns=2
+      const cardWidth=(width - margin*2 - gap*(cardColumns-1))/cardColumns
+      const cardHeight=260
+      const cardRows=Math.ceil(cards.length/cardColumns)
+      const cardsAreaHeight=cardRows*cardHeight + (cardRows-1)*gap
+      const panelHeight=headerHeight + cardsAreaHeight
+      const chartTargetWidth=width - margin*2
+      const baseChartWidth=chartCanvas?.width || chartImage.width || chartTargetWidth
+      const baseChartHeight=chartCanvas?.height || chartImage.height || (chartTargetWidth*0.5)
+      const chartScale=baseChartWidth? chartTargetWidth/Math.max(baseChartWidth,1) : 1
+      const chartTargetHeight=Math.round(baseChartHeight * chartScale)
+      const chartSpacing=48
+      const totalHeight=Math.round(margin + panelHeight + chartSpacing + chartTargetHeight + margin)
 
-    <div className="section card">
-      <div className="row" style={{alignItems:'flex-end'}}>
-        <button onClick={()=>setSamples([])} disabled={!connected}>Reset curva</button>
-        <button className="primary" onClick={()=>start()} disabled={!connected||running}>Start</button>
-        <button onClick={()=>stop()} disabled={!running}>Stop</button>
-        <button onClick={zeroNow} disabled={!connected}>Zero ahora</button>
-        <div className="row">
-          <input id="refw" type="number" step="0.1" placeholder="Peso de referencia (g)" style={{width:220}} />
-          <button onClick={()=>{ const el=document.getElementById('refw'); const v=parseFloat(el.value); if(!isFinite(v)||v<=0) return alert('Valor inválido.'); spanCal(v) }} disabled={!connected}>Calibrar span</button>
+      const canvas=document.createElement('canvas')
+      canvas.width=width
+      canvas.height=totalHeight
+      const ctx=canvas.getContext('2d')
+      if(!ctx) return
+      ctx.fillStyle='#ffffff'
+      ctx.fillRect(0,0,width,totalHeight)
+
+      ctx.fillStyle='#0f172a'
+      ctx.font='bold 34px Arial'
+      ctx.fillText('Panel de resultados', margin, margin+40)
+      ctx.font='20px Arial'
+      ctx.fillStyle='#1e293b'
+      ctx.fillText(analysis.zoneLabel||'', margin, margin+72)
+      ctx.font='16px Arial'
+      ctx.fillStyle='#64748b'
+      ctx.fillText(`Generado: ${new Date().toLocaleString()}`, margin, margin+96)
+      ctx.fillText(`Muestras: ${samples.length}`, margin, margin+118)
+
+      const drawWrappedText=(textCtx,text,x,y,maxWidth,lineHeight)=>{
+        if(!text){ return y }
+        const words=String(text).split(/\s+/)
+        let line=''
+        let currentY=y
+        for(const word of words){
+          const testLine=line? `${line} ${word}` : word
+          if(textCtx.measureText(testLine).width>maxWidth && line){
+            textCtx.fillText(line, x, currentY)
+            line=word
+            currentY+=lineHeight
+          }else{
+            line=testLine
+          }
+        }
+        if(line){
+          textCtx.fillText(line, x, currentY)
+          currentY+=lineHeight
+        }
+        return currentY
+      }
+
+      const drawCard=(card, index)=>{
+        const row=Math.floor(index/cardColumns)
+        const col=index%cardColumns
+        const x=margin + col*(cardWidth+gap)
+        const y=margin + headerHeight + row*(cardHeight+gap)
+        ctx.fillStyle='#f8fafc'
+        ctx.fillRect(x, y, cardWidth, cardHeight)
+        ctx.strokeStyle='#e2e8f0'
+        ctx.lineWidth=1
+        ctx.strokeRect(x, y, cardWidth, cardHeight)
+        ctx.fillStyle='#0f172a'
+        ctx.font='bold 20px Arial'
+        ctx.fillText(card.title, x+16, y+32)
+
+        const barAreaX=x+16
+        let cursorY=y+52
+        const trackWidth=cardWidth-32
+        const trackHeight=14
+
+        const drawValue=(label,value,maxValue,color,unit,decimals)=>{
+          const safeValue=Number.isFinite(value)?value:0
+          const safeMax=maxValue>0?maxValue:1
+          const ratio=Math.max(0, Math.min(1, safeValue/safeMax))
+          ctx.font='12px Arial'
+          ctx.fillStyle='#1e293b'
+          ctx.textAlign='left'
+          ctx.fillText(label, barAreaX, cursorY)
+          ctx.fillStyle='rgba(148,163,184,0.25)'
+          const trackY=cursorY+6
+          ctx.fillRect(barAreaX, trackY, trackWidth, trackHeight)
+          ctx.fillStyle=color
+          ctx.fillRect(barAreaX, trackY, trackWidth*ratio, trackHeight)
+          ctx.fillStyle='#0f172a'
+          ctx.textAlign='right'
+          ctx.fillText(`${safeFixed(safeValue, decimals)}${unit}`, barAreaX+trackWidth, cursorY)
+          ctx.textAlign='left'
+          cursorY=trackY+trackHeight+14
+        }
+
+        const drawStacked=(stacked)=>{
+          if(!stacked) return
+          ctx.font='12px Arial'
+          ctx.fillStyle='#1e293b'
+          ctx.textAlign='left'
+          ctx.fillText(stacked.label, barAreaX, cursorY)
+          const trackY=cursorY+6
+          ctx.fillStyle='rgba(148,163,184,0.25)'
+          ctx.fillRect(barAreaX, trackY, trackWidth, trackHeight)
+          const total=stacked.segments.reduce((sum,segment)=>sum+(Number.isFinite(segment.value)?Math.max(segment.value,0):0),0) || 1
+          let offset=barAreaX
+          stacked.segments.forEach(segment=>{
+            const safeValue=Number.isFinite(segment.value)?Math.max(segment.value,0):0
+            const ratio=total>0? safeValue/total : 0
+            const width=trackWidth*ratio
+            ctx.fillStyle=segment.color || '#22c55e'
+            ctx.fillRect(offset, trackY, width, trackHeight)
+            offset+=width
+          })
+          cursorY=trackY+trackHeight+14
+          ctx.font='11px Arial'
+          let legendX=barAreaX
+          let legendY=cursorY+6
+          stacked.segments.forEach(segment=>{
+            const label=`${segment.label} ${safeFixed(segment.value,0)}%`
+            const textWidth=ctx.measureText(label).width
+            if(legendX + textWidth + 20 > barAreaX + trackWidth){
+              legendX=barAreaX
+              legendY+=18
+            }
+            ctx.fillStyle=segment.color || '#22c55e'
+            ctx.fillRect(legendX, legendY-9, 10, 10)
+            ctx.fillStyle='#1e293b'
+            ctx.fillText(label, legendX+14, legendY)
+            legendX+=textWidth+36
+          })
+          cursorY=legendY+18
+        }
+
+        if(card.stacked){
+          drawStacked(card.stacked)
+        }
+
+        if(Array.isArray(card.bars)){
+          card.bars.forEach(bar=>{
+            drawValue(bar.label, bar.value, bar.max, bar.color, bar.unit || '', bar.decimals ?? 0)
+          })
+        }
+
+        if(Array.isArray(card.notes) && card.notes.length){
+          ctx.font='12px Arial'
+          ctx.fillStyle='#475569'
+          const maxWidth=trackWidth
+          card.notes.forEach(note=>{
+            cursorY=drawWrappedText(ctx, note || '', barAreaX, cursorY, maxWidth, 18)
+            cursorY+=6
+          })
+        }
+        ctx.textAlign='left'
+      }
+
+      cards.forEach((card,idx)=>drawCard(card, idx))
+
+      const chartY=margin + panelHeight + chartSpacing
+      ctx.fillStyle='#f8fafc'
+      ctx.fillRect(margin-8, chartY-32, chartTargetWidth+16, chartTargetHeight+48)
+      ctx.strokeStyle='#e2e8f0'
+      ctx.strokeRect(margin-8, chartY-32, chartTargetWidth+16, chartTargetHeight+48)
+      ctx.fillStyle='#0f172a'
+      ctx.font='bold 22px Arial'
+      ctx.fillText('Curva de peso y flujo', margin, chartY-6)
+      ctx.drawImage(chartImage, margin, chartY, chartTargetWidth, chartTargetHeight)
+
+      const compositeUrl=canvas.toDataURL('image/png')
+      const a=document.createElement('a')
+      a.href=compositeUrl
+      a.download='panel_grafico.png'
+      a.click()
+    }catch(err){
+      console.error('No se pudo exportar el panel', err)
+    }
+  }
+
+  function downloadResults(){
+    const series=samples.map(sample=>({
+      t:Number.isFinite(sample?.t)?Number(sample.t.toFixed(3)):0,
+      g:Number.isFinite(sample?.g)?Number(sample.g.toFixed(3)):0,
+      flow:Number.isFinite(sample?.flow)?Number(sample.flow.toFixed(3)):0
+    }))
+    const lastSeries=series[series.length-1] || { t:0, g:0, flow:0 }
+    const serializedZoneGuide=(analysis.zoneGuide||[]).map(entry=>({
+      t:Number.isFinite(entry?.t)?Number(entry.t.toFixed(3)):0,
+      min:Number.isFinite(entry?.min)?Number(entry.min.toFixed(3)):0,
+      max:Number.isFinite(entry?.max)?Number(entry.max.toFixed(3)):0
+    }))
+    const extractionDuration=analysis?.extractionDuration ?? (extractionInfo.active ? extractionInfo.duration : extractionInfo.lastDuration)
+    const payload={
+      generatedAt:new Date().toISOString(),
+      runtime:{
+        elapsed:Number.isFinite(elapsed)?Number(elapsed.toFixed(2)):0,
+        extractionDuration:Number.isFinite(extractionDuration)?Number(extractionDuration.toFixed(2)):0,
+        tare:{
+          applied:!!tareApplied,
+          value:Number.isFinite(tareValueG)?Number(tareValueG.toFixed(3)):0,
+          timestamp:tareTime
+        },
+        lastSample:{
+          t:lastSeries.t,
+          netG:lastSeries.g,
+          absG:Number.isFinite(absG)?Number(absG.toFixed(3)):lastSeries.g,
+          flowGps:lastSeries.flow
+        }
+      },
+      samples:{
+        count:samples.length,
+        series
+      },
+      metrics:{
+        preinfusionDuration:analysis.preinfusionDuration,
+        avgFlow:analysis.avgFlow,
+        peakFlow:analysis.peakFlow,
+        finalFlow:analysis.finalFlow,
+        hydraulicScore:analysis.hydraulicScore,
+        flowCorrelation:analysis.flowCorrelation,
+        channelingIndex:analysis.channelingIndex,
+        channelingSpikes:analysis.channelingSpikes,
+        maxAccel:analysis.maxAccel,
+        flowDistribution:analysis.flowDistribution,
+        rampTime:analysis.rampTime,
+        rampSlope:analysis.rampSlope,
+        minFlow:analysis.minFlow,
+        extractionDuration:analysis.extractionDuration,
+        totalDuration:analysis.totalDuration,
+        safeFlowRange:[FLOW_OPTIMAL_MIN,FLOW_OPTIMAL_MAX],
+        preinfusionThreshold:PREINFUSION_THRESHOLD,
+        zoneCoverage:analysis.zoneCoverage,
+        zoneAverageGap:analysis.zoneAverageGap,
+        zoneMaxGap:analysis.zoneMaxGap,
+        zonePresetId:analysis.zonePresetId
+      },
+      zonePreset:{
+        id:analysis.zonePresetId,
+        label:analysis.zoneLabel,
+        short:analysis.zoneShort,
+        description:analysis.zoneDescription,
+        envelope:(activeZone?.envelope||[]).map(point=>(
+          { progress:point.progress, min:point.min, max:point.max }
+        ))
+      },
+      zoneGuide:serializedZoneGuide,
+      narratives:{
+        hydraulic:analysis.hydraulicSummary,
+        channeling:analysis.channelingSummary,
+        distribution:analysis.flowDistributionSummary,
+        zone:analysis.zoneSummary
+      }
+    }
+    const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'})
+    const url=URL.createObjectURL(blob)
+    const a=document.createElement('a')
+    a.href=url
+    a.download='espresso_results.json'
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  function triggerImportResults(){
+    if(importInputRef.current){
+      importInputRef.current.value=''
+      importInputRef.current.click()
+    }
+  }
+
+  async function handleImportResults(event){
+    const file=event.target?.files?.[0]
+    if(!file) return
+    try{
+      const text=await file.text()
+      const parsed=JSON.parse(text)
+      const seriesSource=Array.isArray(parsed?.samples?.series)?parsed.samples.series:
+        Array.isArray(parsed?.series)?parsed.series:
+        Array.isArray(parsed?.sampleSeries)?parsed.sampleSeries:
+        (Array.isArray(parsed?.samples)&&parsed.samples.length&&typeof parsed.samples[0]==='object'?parsed.samples:[])
+      const sanitized=seriesSource.map(item=>{
+        const t=parseNumber(item?.t ?? item?.time ?? item?.seconds ?? item?.timestamp)
+        const g=parseNumber(item?.g ?? item?.net ?? item?.netG ?? item?.weight ?? item?.value)
+        const flowValue=parseNumber(item?.flow ?? item?.flowGps ?? item?.f ?? item?.rate)
+        return Number.isFinite(t) && Number.isFinite(g) ? {
+          t,
+          g,
+          flow:Number.isFinite(flowValue)?flowValue:null
+        } : null
+      }).filter(Boolean)
+      if(!sanitized.length){
+        throw new Error('El archivo no contiene muestras válidas.')
+      }
+      const sorted=sanitized.sort((a,b)=>a.t-b.t)
+      let previous=null
+      for(const sample of sorted){
+        if(!Number.isFinite(sample.flow) && previous){
+          const dt=Math.max(1e-3, sample.t-previous.t)
+          sample.flow=(sample.g-previous.g)/dt
+        }
+        if(!Number.isFinite(sample.flow)){
+          sample.flow=0
+        }
+        sample.t=Number(sample.t.toFixed(3))
+        sample.g=Number(sample.g.toFixed(3))
+        sample.flow=Number(sample.flow.toFixed(3))
+        previous=sample
+      }
+      const finalSample=sorted[sorted.length-1]
+      const runtime=parsed?.runtime || {}
+      const tareMeta=runtime?.tare || {}
+      const zoneId=parsed?.metrics?.zonePresetId || parsed?.zonePreset?.id
+      const importElapsedValue=parseNumber(runtime?.elapsed)
+      const importExtractionValue=Number.isFinite(runtime?.extractionDuration)?Number(runtime.extractionDuration):parseNumber(parsed?.metrics?.extractionDuration)
+      const importAbsValue=parseNumber(runtime?.lastSample?.absG ?? runtime?.absoluteWeight)
+      const importFlowValue=parseNumber(runtime?.lastSample?.flowGps ?? runtime?.flow)
+      const tareValueValue=parseNumber(tareMeta?.value)
+      const importElapsed=Number.isFinite(importElapsedValue)?importElapsedValue:finalSample.t
+      const importExtraction=Number.isFinite(importExtractionValue)?importExtractionValue:null
+
+      resetFilters()
+      runningRef.current=false
+      setRunning(false)
+      startTimeRef.current=null
+      lastCapturedRef.current=null
+      flowRef.current={ time:null, net:finalSample.g }
+      extractionRef.current={ baseline:finalSample.g, hasBaseline:true, active:false, start:0, lastRiseTime:performance.now(), lastRiseWeight:finalSample.g }
+
+      setSamples(sorted)
+      setNetG(Number(finalSample.g.toFixed(2)))
+      const resolvedAbs=Number.isFinite(importAbsValue)?importAbsValue:finalSample.g
+      const resolvedFlow=Number.isFinite(importFlowValue)?importFlowValue:finalSample.flow
+      setAbsG(Number(resolvedAbs.toFixed(2)))
+      setFlowGps(Number(resolvedFlow.toFixed(3)))
+      setElapsed(Number(importElapsed.toFixed(2)))
+      setExtractionInfo({active:false,duration:0,lastDuration:Number.isFinite(importExtraction)?Number(importExtraction.toFixed(2)):0})
+      setTareApplied(Boolean(tareMeta?.applied))
+      setTareValueG(Number.isFinite(tareValueValue)?Number(tareValueValue.toFixed(2)):0)
+      setTareTime(tareMeta?.timestamp || null)
+      if(zoneId && FLOW_ZONE_PRESETS[zoneId]){
+        setZonePreset(zoneId)
+      }
+      setSimulatorStatus('Datos importados para visualización')
+      setErrorMsg('')
+    }catch(err){
+      console.error('No se pudo importar datos', err)
+      alert(`No se pudo importar el archivo: ${err?.message || err}`)
+    }finally{
+      if(event?.target){ event.target.value='' }
+    }
+  }
+
+  function formatTime(seconds, decimals=0){
+    if(!isFinite(seconds)) return '0:00'
+    const total=Math.max(0, seconds)
+    const minutes=Math.floor(total/60)
+    const secValue=total-minutes*60
+    const width=decimals>0? 3+decimals : 2
+    const secStr=(decimals>0? secValue.toFixed(decimals) : Math.floor(secValue).toString()).padStart(width,'0')
+    return `${minutes}:${secStr}`
+  }
+
+  useEffect(()=>{
+    if(!running) return
+    let raf
+    const tick=()=>{
+      if(startTimeRef.current){
+        const now=performance.now()
+        const elapsedSec=Number(((now-startTimeRef.current)/1000).toFixed(2))
+        setElapsed(prev=>Math.abs(prev-elapsedSec)>0.009?elapsedSec:prev)
+        if(extractionRef.current.active){
+          const exDuration=Number(((now-extractionRef.current.start)/1000).toFixed(2))
+          setExtractionInfo(prev=>{
+            if(!prev.active) return prev
+            if(Math.abs(prev.duration-exDuration)<=0.009) return prev
+            return {...prev,duration:exDuration}
+          })
+        }
+      }
+      raf=requestAnimationFrame(tick)
+    }
+    tick()
+    return ()=>{ if(raf) cancelAnimationFrame(raf) }
+  },[running])
+
+  useEffect(()=>{
+    if(!running && samples.length===0){
+      setElapsed(0)
+    }
+  },[running, samples])
+
+  function simulateExtraction(mode){
+    const result=generateSimulatedExtraction(mode)
+    resetFilters()
+    runningRef.current=false
+    setRunning(false)
+    startTimeRef.current=null
+    lastCapturedRef.current=null
+    extractionRef.current={ baseline:0, hasBaseline:true, active:false, start:0, lastRiseTime:0, lastRiseWeight:0 }
+    flowRef.current={ time:null, net:result.finalWeight }
+    setSamples(result.samples)
+    setAbsG(Number(result.finalWeight.toFixed(2)))
+    setNetG(Number(result.finalWeight.toFixed(2)))
+    setFlowGps(0)
+    setElapsed(Number(result.totalDuration.toFixed(2)))
+    setExtractionInfo({active:false,duration:0,lastDuration:result.extractionDuration})
+    setTareApplied(true)
+    setTareValueG(0)
+    setTareTime(new Date().toISOString())
+    setErrorMsg('')
+    setSimulatorStatus(`Simulación ${mode==='optimal'?'en rango':`fuera de rango (${result.profileLabel})`} lista`)
+  }
+
+  function runCustomSimulation(){
+    const parsedTds = simInputs.tds === '' ? null : parseNumber(simInputs.tds)
+    const result = simulateFromUserInputs({
+      ...simInputs,
+      tds: parsedTds
+    })
+    resetFilters()
+    runningRef.current=false
+    setRunning(false)
+    startTimeRef.current=null
+    lastCapturedRef.current=null
+    extractionRef.current={ baseline:0, hasBaseline:true, active:false, start:0, lastRiseTime:0, lastRiseWeight:0 }
+    flowRef.current={ time:null, net:result.finalWeight }
+    setSamples(result.samples)
+    setAbsG(Number(result.finalWeight.toFixed(2)))
+    setNetG(Number(result.finalWeight.toFixed(2)))
+    setFlowGps(0)
+    setElapsed(Number(result.totalDuration.toFixed(2)))
+    setExtractionInfo({active:false,duration:0,lastDuration:result.extractionDuration})
+    setTareApplied(true)
+    setTareValueG(0)
+    setTareTime(new Date().toISOString())
+    setErrorMsg('')
+    setSimulatorStatus('Simulación personalizada lista')
+  }
+
+  return (
+    <div className="container">
+      <input ref={importInputRef} type="file" accept="application/json" style={{display:'none'}} onChange={handleImportResults} />
+      <div className="card">
+        <div className="row" style={{justifyContent:'space-between',marginBottom:10}}>
+          <div className="row" style={{gap:8}}>
+            <button className={activeView==='tracker'?'primary':''} onClick={()=>setActiveView('tracker')}>Tracker</button>
+            <button className={activeView==='foundation'?'primary':''} onClick={()=>setActiveView('foundation')}>Fundamento matemático</button>
+          </div>
         </div>
-        <button onClick={downloadCSV} disabled={samples.length===0}>Exportar CSV</button>
+        {activeView==='foundation' ? (
+          <div className="foundation-page">
+            <h2>Fundamento matemático y científico</h2>
+            <p className="sub">Esta página documenta las fórmulas implementadas en la app para los cuatro paneles analíticos.</p>
+
+            <section className="foundation-section">
+              <h3>1) Relación resistencia-flujo</h3>
+              <p><b>Señales base:</b> flujo instantáneo <code>q(t)</code> en g/s y peso acumulado <code>m(t)</code> en g.</p>
+              <p><b>Métricas:</b></p>
+              <ul>
+                <li>Flujo promedio: <code>q̄ = (1/N) Σ qᵢ</code>.</li>
+                <li>Pico de flujo: <code>qₚ = max(qᵢ)</code>.</li>
+                <li>Índice hidráulico: <code>IH = clamp((1 - q̄/qₚ)·100, 0, 100)</code>.</li>
+                <li>Rampa inicial: pendiente de <code>q(t)</code> en la ventana inicial de extracción.</li>
+                <li>Correlación flujo-peso (Pearson): <code>ρ = cov(m, q)/(σₘσ_q)</code>.</li>
+              </ul>
+              <p><b>Fundamento:</b> en hidráulica de lechos porosos (cama de café), una alta resistencia efectiva tiende a limitar el caudal medio respecto al pico transitorio; por eso la relación <code>q̄/qₚ</code> sirve como descriptor operacional de apertura del flujo.</p>
+            </section>
+
+            <section className="foundation-section">
+              <h3>2) Índice de canalización</h3>
+              <p><b>Definiciones robustas:</b> mediana del flujo <code>med(q)</code> y MAD <code>med(|q - med(q)|)</code>.</p>
+              <ul>
+                <li>Umbral de pico: <code>q_thr = med(q) + 3·MAD(q)</code>.</li>
+                <li>Aceleración de flujo: <code>aᵢ = (qᵢ - qᵢ₋₁)/Δt</code>.</li>
+                <li>Pico de canalización: evento con <code>qᵢ &gt; q_thr</code> y <code>aᵢ &gt; 1 g/s²</code>.</li>
+                <li>Índice: <code>IC = clamp((#picos/(N-1))·250, 0, 100)</code>.</li>
+              </ul>
+              <p><b>Fundamento:</b> la canalización se manifiesta como aceleraciones bruscas y sobrecaudal local por vías preferenciales; usar mediana+MAD reduce sensibilidad a ruido y outliers.</p>
+            </section>
+
+            <section className="foundation-section">
+              <h3>3) Distribución del flujo</h3>
+              <p>Se integra el tiempo de extracción en tres estados usando límites globales:</p>
+              <ul>
+                <li>Bajo: <code>q &lt; FLOW_OPTIMAL_MIN</code></li>
+                <li>Óptimo: <code>FLOW_OPTIMAL_MIN ≤ q ≤ FLOW_OPTIMAL_MAX</code></li>
+                <li>Alto: <code>q &gt; FLOW_OPTIMAL_MAX</code></li>
+              </ul>
+              <p>Porcentaje por clase: <code>P_k = 100·T_k/(T_bajo+T_óptimo+T_alto)</code>.</p>
+              <p><b>Fundamento:</b> cuantifica estabilidad del tiro en términos temporales (no solo por picos), consistente con interpretación barista de sub/sobre extracción según predominio de caudales altos o bajos.</p>
+            </section>
+
+            <section className="foundation-section">
+              <h3>4) Zona segura (SINPF y CONPF)</h3>
+              <p>La app carga una envolvente de referencia desde CSV para cada modo:</p>
+              <ul>
+                <li><b>SINPF:</b> sin preinfusión prolongada.</li>
+                <li><b>CONPF:</b> con preinfusión.</li>
+              </ul>
+              <p>Para cada progreso normalizado <code>p∈[0,1]</code>, se interpola un rango <code>[q_min(p), q_max(p)]</code>. Luego cada muestra se clasifica:</p>
+              <ul>
+                <li>En zona si <code>q_min ≤ q ≤ q_max</code></li>
+                <li>Debajo si <code>q &lt; q_min</code></li>
+                <li>Encima si <code>q &gt; q_max</code></li>
+              </ul>
+              <p>Se reportan coberturas temporales y brechas:</p>
+              <ul>
+                <li><code>Coverage_k = 100·T_k/T_total</code></li>
+                <li><code>Gap_avg = Σ(gap·Δt)/T_total</code></li>
+                <li><code>Gap_max = max(gap)</code></li>
+              </ul>
+              <p><b>Fundamento:</b> comparar contra una banda dependiente del tiempo/progreso refleja mejor la dinámica real de la extracción que un único umbral fijo.</p>
+            </section>
+          </div>
+        ) : (
+          <>
+        <div className="row" style={{justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+          <div className="row" style={{alignItems:'center',gap:12}}>
+            <img src={logo} alt="Smart Espresso Tracker" className="logo" />
+            <div>
+              <h1 style={{margin:'0 0 4px',fontSize:'1.8rem'}}>Smart Espresso Tracker</h1>
+              <div className="sub">Mentor Coffee Scale • Web Bluetooth</div>
+            </div>
+          </div>
+          <div className="row" style={{gap:12,alignItems:'flex-end',justifyContent:'flex-end'}}>
+            <div className="simulator-box">
+              <div className="sim-label">Simulador</div>
+              <div className="row" style={{gap:6,flexWrap:'nowrap'}}>
+                <button onClick={()=>simulateExtraction('optimal')} disabled={running||connecting||connected} title={connected?'Desconecta la balanza para simular.':''}>En rango</button>
+                <button onClick={()=>simulateExtraction('off')} disabled={running||connecting||connected} title={connected?'Desconecta la balanza para simular.':''}>Fuera de rango</button>
+              </div>
+              <div className="sim-grid">
+                <label>Peso bebida (g)<input type="number" min="1" step="0.1" value={simInputs.targetWeight} onChange={e=>setSimInputs(prev=>({...prev,targetWeight:e.target.value}))} /></label>
+                <label>Tiempo total (s)<input type="number" min="8" step="0.1" value={simInputs.extractionTime} onChange={e=>setSimInputs(prev=>({...prev,extractionTime:e.target.value}))} /></label>
+                <label>Primera gota (s)<input type="number" min="0.5" step="0.1" value={simInputs.firstDropTime} onChange={e=>setSimInputs(prev=>({...prev,firstDropTime:e.target.value}))} /></label>
+                <label>Dosis café (g)<input type="number" min="1" step="0.1" value={simInputs.dose} onChange={e=>setSimInputs(prev=>({...prev,dose:e.target.value}))} /></label>
+                <label>TDS (%)<input type="number" min="0" step="0.1" value={simInputs.tds} onChange={e=>setSimInputs(prev=>({...prev,tds:e.target.value}))} /></label>
+                <label className="sim-check"><input type="checkbox" checked={simInputs.hasPreinfusion} onChange={e=>setSimInputs(prev=>({...prev,hasPreinfusion:e.target.checked}))} />Preinfusión</label>
+              </div>
+              <button onClick={runCustomSimulation} disabled={running||connecting||connected} title={connected?'Desconecta la balanza para simular.':''}>Simular con datos</button>
+              {simulatorStatus && <div className="sim-status">{simulatorStatus}</div>}
+            </div>
+            <span className="pill">{connected?`Conectado${deviceName?` a ${deviceName}`:''}`:'Desconectado'}</span>
+          </div>
+        </div>
+
+        <div className="row" style={{marginBottom:16}}>
+          <button className="primary" disabled={connecting||connected} onClick={connect}>{connecting?'Escaneando…':'Conectar'}</button>
+          <button onClick={disconnect} disabled={!connected}>Desconectar</button>
+          <button onClick={resetCurve} disabled={!connected}>Reset curva</button>
+          <button className="primary" onClick={start} disabled={!connected||running}>Iniciar</button>
+          <button onClick={stop} disabled={!connected}>Stop</button>
+        </div>
+
+        {errorMsg && <div className="error" style={{marginBottom:16}}>Error: {errorMsg}</div>}
+
+        <div className="grid" style={{marginBottom:16}}>
+          <div className="card" style={{padding:'16px'}}>
+            <div className="sub">Peso neto (con TARE)</div>
+            <div className="metric">{netG.toFixed(2)} <span className="sub">g</span></div>
+            <div className="sub">Velocidad de flujo: {flowGps.toFixed(2)} g/s</div>
+          </div>
+          <div className="card" style={{padding:'16px'}}>
+            <div className="sub">Peso absoluto</div>
+            <div className="metric-sm">{absG.toFixed(2)} <span className="sub">g</span></div>
+            <div className="sub">TARE aplicado: {tareApplied ? <span className="ok">sí</span> : <span className="warn">no</span>}</div>
+            <div className="sub">Valor TARE: <span className="kbd">{tareValueG.toFixed(2)} g</span> {tareTime && <span className="small">({new Date(tareTime).toLocaleTimeString()})</span>}</div>
+          </div>
+          <div className="card" style={{padding:'16px'}}>
+            <div className="sub">Timer total</div>
+            <div className="metric-sm">{formatTime(elapsed)}</div>
+            <div className="sub">Extraction time: <span className="kbd">{extractionInfo.active ? formatTime(extractionInfo.duration,1) : extractionInfo.lastDuration ? formatTime(extractionInfo.lastDuration,1) : '—'}</span> {extractionInfo.active ? <span className="ok">en curso</span> : extractionInfo.lastDuration ? <span className="ok">última</span> : <span className="warn">pendiente</span>}</div>
+          </div>
+        </div>
+
+        <div className="section card" style={{marginBottom:16}}>
+          <div className="row" style={{justifyContent:'space-between',alignItems:'center',gap:12,flexWrap:'wrap'}}>
+            <div className="row" style={{alignItems:'center',gap:12,flexWrap:'wrap'}}>
+              <h3 style={{margin:'0'}}>Panel de resultados</h3>
+              <div className="row" style={{alignItems:'center',gap:8}}>
+                <label htmlFor="zonePreset" className="sub">Zona segura</label>
+                <select id="zonePreset" value={zonePreset} onChange={e=>setZonePreset(e.target.value)}>
+                  {Object.values(FLOW_ZONE_PRESETS).map(zone=>(
+                    <option key={zone.id} value={zone.id}>{zone.optionLabel}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="row" style={{gap:8,flexWrap:'wrap'}}>
+              <button onClick={triggerImportResults}>Importar datos (JSON)</button>
+              <button onClick={downloadPanelComposite} disabled={samples.length===0}>Exportar panel + gráfico</button>
+              <button onClick={downloadResults} disabled={samples.length===0}>Exportar datos (JSON)</button>
+            </div>
+          </div>
+          <div className="grid" style={{marginTop:12}}>
+            <div className="card result-card">
+              <div className="result-title">Relación resistencia-flujo</div>
+              <HorizontalMetricBar label="Índice hidráulico" value={analysis.hydraulicScore} max={100} color="#38bdf8" />
+              <HorizontalMetricBar label="Flujo promedio" value={analysis.avgFlow} max={5} unit=" g/s" color="#60a5fa" decimals={2} />
+              <HorizontalMetricBar label="Pico de flujo" value={analysis.peakFlow} max={5} unit=" g/s" color="#22d3ee" decimals={2} />
+              <HorizontalMetricBar label="Flujo final" value={analysis.finalFlow} max={5} unit=" g/s" color="#0ea5e9" decimals={2} />
+              <HorizontalMetricBar label="Rampa inicial" value={analysis.rampSlope} max={5} unit=" g/s²" color="#0284c7" decimals={2} />
+              <div className="result-chips">
+                <span className="result-chip">90% pico: {analysis.rampTime>0?`${analysis.rampTime.toFixed(1)} s`:'—'}</span>
+                <span className="result-chip">{analysis.hydraulicSummary}</span>
+              </div>
+            </div>
+            <div className="card result-card">
+              <div className="result-title">Índice de canalización</div>
+              <HorizontalMetricBar label="Canalización" value={analysis.channelingIndex} max={100} color="#f97316" />
+              <HorizontalMetricBar label="Picos" value={analysis.channelingSpikes} max={10} unit=" eventos" color="#fb923c" decimals={0} />
+              <HorizontalMetricBar label="Aceleración máx" value={analysis.maxAccel} max={6} unit=" g/s²" color="#fbbf24" decimals={2} />
+              <div className="result-chips">
+                <span className="result-chip">{analysis.channelingSummary}</span>
+              </div>
+            </div>
+            <div className="card result-card">
+              <div className="result-title">Distribución del flujo</div>
+              <ResultStackedBar
+                label={`Rango óptimo ${FLOW_OPTIMAL_MIN}-${FLOW_OPTIMAL_MAX} g/s`}
+                segments={[
+                  { key:'low', label:'Bajo', value:analysis.flowDistribution.low, color:'#64748b' },
+                  { key:'opt', label:'Óptimo', value:analysis.flowDistribution.optimal, color:'#22c55e' },
+                  { key:'high', label:'Alto', value:analysis.flowDistribution.high, color:'#f97316' }
+                ]}
+              />
+              <HorizontalMetricBar label="Preinfusión" value={analysis.preinfusionDuration} max={10} unit=" s" color="#4ade80" decimals={1} />
+              <HorizontalMetricBar label="Flujo mínimo" value={analysis.minFlow} max={5} unit=" g/s" color="#2dd4bf" decimals={2} />
+              <div className="result-chips">
+                <span className="result-chip">{analysis.flowDistributionSummary}</span>
+              </div>
+            </div>
+            <div className="card result-card">
+              <div className="result-title">Zona segura ({analysis.zoneShort})</div>
+              <ResultStackedBar
+                label="Cobertura"
+                segments={[
+                  { key:'inside', label:'En zona', value:analysis.zoneCoverage.inside, color:'#22c55e' },
+                  { key:'below', label:'Debajo', value:analysis.zoneCoverage.below, color:'#60a5fa' },
+                  { key:'above', label:'Encima', value:analysis.zoneCoverage.above, color:'#f97316' }
+                ]}
+              />
+              <HorizontalMetricBar label="Brecha media" value={analysis.zoneAverageGap} max={5} unit=" g/s" color="#86efac" decimals={2} />
+              <HorizontalMetricBar label="Brecha máxima" value={analysis.zoneMaxGap} max={5} unit=" g/s" color="#bbf7d0" decimals={2} />
+              <div className="result-chips">
+                <span className="result-chip">{analysis.zoneLabel}</span>
+                {analysis.zoneDescription && <span className="result-chip subtle">{analysis.zoneDescription}</span>}
+                <span className="result-chip">{analysis.zoneSummary}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="section card" style={{marginBottom:16}}>
+          <div className="row" style={{flexWrap:'wrap',gap:12}}>
+            <button onClick={applyTare} disabled={!connected}>(TARE)</button>
+            <div className="row" style={{alignItems:'center',gap:8}}>
+              <input id="refw" type="number" step="0.1" placeholder="Peso de referencia (g)" style={{width:220}} />
+              <button onClick={()=>{ const el=document.getElementById('refw'); const v=parseFloat(el.value); if(!isFinite(v)||v<=0) return alert('Valor inválido.'); spanCal(v) }} disabled={!connected}>Calibrar span</button>
+            </div>
+            <button onClick={downloadCSV} disabled={samples.length===0}>Exportar CSV</button>
+            <button onClick={downloadChartImage} disabled={samples.length===0}>Exportar gráfico</button>
+          </div>
+          <div className="small" style={{marginTop:8}}>Flujo: derivada del peso neto. Usa <b>(TARE)</b> con la taza vacía y calibra con un peso conocido para ajustar <i>scale</i>.</div>
+        </div>
+
+        <div className="section card" style={{marginBottom:16}}>
+          <h3 style={{marginTop:0,marginBottom:4}}>Perfiles de TARE</h3>
+          <div className="sub" style={{marginBottom:12}}>Guarda y recupera la calibración de cada taza o portafiltro.</div>
+          <div className="row" style={{flexWrap:'wrap'}}>
+            <select value={currentProfile} onChange={e=>loadProfile(e.target.value)}>
+              <option value={currentProfile}>{currentProfile}</option>
+              {Object.keys(profiles).filter(p=>p!==currentProfile).map(p=>(<option key={p} value={p}>{p}</option>))}
+            </select>
+            <input type="text" id="pname" placeholder="Nombre de perfil (ej. Taza A)" style={{width:240}} />
+            <button onClick={()=>{ const n=document.getElementById('pname').value.trim(); saveProfile(n) }}>Guardar perfil</button>
+            <button onClick={()=>{ const n=currentProfile; if(n==='default') return alert('No puedes borrar el perfil default'); if(confirm('¿Borrar perfil '+n+'?')) deleteProfile(n) }}>Borrar perfil actual</button>
+          </div>
+        </div>
+
+        <div style={{marginTop:16, height:260}}><Line ref={chartRef} data={chartData} options={chartOptions}/></div>
+
+        <div className="footer">Desarrollada por Jairon Francisco para Café Maguana/Escuela de Café</div>
+        </>
+        )}
       </div>
-      <div className="small" style={{marginTop:8}}>Flujo: derivada del peso neto. Haz <b>Zero ahora</b> con la taza vacía; luego calibra con un peso conocido para ajustar <i>scale</i>.</div>
     </div>
-
-    <div className="section card">
-      <div className="row">
-        <select value={currentProfile} onChange={e=>loadProfile(e.target.value)}>
-          <option value={currentProfile}>{currentProfile}</option>
-          {Object.keys(profiles).filter(p=>p!==currentProfile).map(p=>(<option key={p} value={p}>{p}</option>))}
-        </select>
-        <input type="text" id="pname" placeholder="Nombre de perfil (ej. Taza A)" style={{width:240}} />
-        <button onClick={()=>{ const n=document.getElementById('pname').value.trim(); saveProfile(n) }}>Guardar perfil</button>
-        <button onClick={()=>{ const n=currentProfile; if(n==='default') return alert('No puedes borrar el perfil default'); if(confirm('¿Borrar perfil '+n+'?')) deleteProfile(n) }}>Borrar perfil actual</button>
-      </div>
-      <div className="small" style={{marginTop:6}}>Cada perfil guarda <b>zeroRaw</b> y <b>scale</b> (por ejemplo, para diferentes tazas o posiciones).</div>
-    </div>
-
-    <div style={{marginTop:16}}><Line data={chartData} options={chartOptions} height={120}/></div>
-
-    <div className="footer">HTTPS + Chrome/Edge. Android: habilita Ubicación y Dispositivos cercanos para Chrome.</div>
-  </div></div>)
+  )
 }
