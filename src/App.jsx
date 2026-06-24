@@ -227,6 +227,46 @@ const FLOW_ZONE_PRESETS = Object.fromEntries(
   })
 )
 
+
+const FAQ_TERMS = [
+  {
+    term:'Uniformidad de flujo',
+    description:'Score de estabilidad calculado con la variabilidad relativa del flujo activo. No representa resistencia hidráulica real ni permeabilidad medida del puck.'
+  },
+  {
+    term:'Índice de canalización',
+    description:'Indicador de patrón compatible con canalización o degradación del puck. Combina salida por encima de zona, aceleración final, picos, inestabilidad y aceleración máxima; no confirma canalización.'
+  },
+  {
+    term:'Zona segura',
+    description:'Referencia cargada desde CSV. El diagnóstico compara cada punto con segmentos reales de la zona; la banda visual de la gráfica es solo una guía.'
+  },
+  {
+    term:'Cobertura en zona',
+    description:'Porcentaje del tiempo activo cuyo flujo cae dentro de alguno de los segmentos válidos de la zona segura seleccionada.'
+  },
+  {
+    term:'Salida por encima de zona',
+    description:'Tiempo en el que el flujo queda por encima del segmento válido más cercano. Puede sugerir flujo irregular, molienda gruesa, erosión o canalización, pero debe confirmarse con preparación y sabor.'
+  },
+  {
+    term:'Latencia de percolación',
+    description:'Tiempo hasta que la balanza detecta flujo sostenido en taza. No equivale a medir físicamente toda la preinfusión dentro del puck.'
+  },
+  {
+    term:'Referencia clásica 1.5–3.5 g/s',
+    description:'Rango general de flujo usado como orientación secundaria. Para decisiones de ajuste, prioriza la zona segura activa.'
+  },
+  {
+    term:'Brecha media y máxima',
+    description:'Distancia promedio y máxima frente al segmento válido más cercano cuando el flujo sale de zona.'
+  },
+  {
+    term:'Rampa inicial y aceleración máxima',
+    description:'Cambios de velocidad del flujo. Valores altos pueden aparecer en aperturas bruscas, picos o degradación del puck.'
+  }
+]
+
 const randomBetween = (min, max) => min + (max - min) * Math.random()
 
 const formatNumber = (value, decimals = 0) => Number.isFinite(value) ? value.toFixed(decimals) : '—'
@@ -505,6 +545,7 @@ export default function App(){
   const [connecting,setConnecting]=useState(false)
   const [deviceName,setDeviceName]=useState('')
   const [errorMsg,setErrorMsg]=useState('')
+  const [currentPage,setCurrentPage]=useState('dashboard')
 
   const [profiles,setProfiles]=useLocalStorage('mentor.profiles', {})
   const [currentProfile,setCurrentProfile]=useLocalStorage('mentor.currentProfile', 'default')
@@ -1193,6 +1234,53 @@ export default function App(){
     setSimulatorPlan(null)
   }
 
+  const shotSummary=useMemo(()=>{
+    if(samples.length<3){
+      return {
+        headline:'Sin datos suficientes',
+        detail:'Inicia un shot, importa datos o ejecuta una simulación para resumir el comportamiento general.',
+        chips:['Pendiente de datos']
+      }
+    }
+    const zoneInside=analysis.zoneCoverage?.inside || 0
+    const channeling=analysis.channelingIndex || 0
+    const uniformity=analysis.hydraulicScore || 0
+    const avgFlow=analysis.avgFlow || 0
+    let headline='Shot estable'
+    if(zoneInside>=65 && uniformity>=70 && channeling<25){
+      headline='Shot estable y alineado con la zona segura'
+    }else if(channeling>=70){
+      headline='Patrón fuertemente compatible con canalización o degradación'
+    }else if(zoneInside<45 || uniformity<45 || channeling>=45){
+      headline='Shot irregular; conviene revisar preparación'
+    }else{
+      headline='Shot con variaciones moderadas'
+    }
+
+    const detailParts=[]
+    if(zoneInside>=65){ detailParts.push('La mayor parte del flujo permanece dentro de la zona segura activa') }
+    else if((analysis.zoneCoverage?.above || 0) > (analysis.zoneCoverage?.below || 0)){ detailParts.push('Predomina salida por encima de zona') }
+    else if((analysis.zoneCoverage?.below || 0) > (analysis.zoneCoverage?.above || 0)){ detailParts.push('Predomina flujo por debajo de zona') }
+    else { detailParts.push('La cobertura de zona es mixta') }
+
+    if(uniformity>=70){ detailParts.push('la entrega es razonablemente uniforme') }
+    else { detailParts.push('el flujo muestra irregularidad') }
+
+    if(channeling>=45){ detailParts.push('hay señales compatibles con canalización o degradación del puck') }
+    else { detailParts.push('hay pocas señales compatibles con canalización') }
+
+    return {
+      headline,
+      detail:`${detailParts.join(', ')}.`,
+      chips:[
+        `Zona ${formatNumber(zoneInside,0)}%`,
+        `Uniformidad ${formatNumber(uniformity,0)}`,
+        `Canalización ${formatNumber(channeling,0)}`,
+        `Flujo medio ${formatNumber(avgFlow,2)} g/s`
+      ]
+    }
+  },[analysis, samples])
+
   const chartData=useMemo(()=>{
     const labels=samples.map(s=>s.t.toFixed(2))
     const preIndex=analysis.preinfusionIndex||0
@@ -1867,6 +1955,10 @@ export default function App(){
               <h1 style={{margin:'0 0 4px',fontSize:'1.8rem'}}>Smart Espresso Tracker</h1>
               <div className="sub">Mentor Coffee Scale • Web Bluetooth</div>
             </div>
+            <div className="row" style={{gap:6}}>
+              <button className={currentPage==='dashboard'?'primary':''} onClick={()=>setCurrentPage('dashboard')}>Panel</button>
+              <button className={currentPage==='faq'?'primary':''} onClick={()=>setCurrentPage('faq')}>FAQ</button>
+            </div>
           </div>
           <div className="row" style={{gap:12,alignItems:'flex-end',justifyContent:'flex-end'}}>
             <div className="simulator-box">
@@ -1890,6 +1982,21 @@ export default function App(){
           </div>
         </div>
 
+        {currentPage==='faq' ? (
+          <div className="section card" style={{marginBottom:16}}>
+            <h3 style={{marginTop:0}}>FAQ del panel visual</h3>
+            <div className="sub" style={{marginBottom:12}}>Glosario de términos usados en el análisis. Las métricas describen patrones derivados de peso, tiempo y flujo; no son diagnósticos definitivos.</div>
+            <div className="grid">
+              {FAQ_TERMS.map(item=>(
+                <div key={item.term} className="card result-card">
+                  <div className="result-title">{item.term}</div>
+                  <div className="small">{item.description}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <>
         <div className="row" style={{marginBottom:16}}>
           <button className="primary" disabled={connecting||connected} onClick={connect}>{connecting?'Escaneando…':'Conectar'}</button>
           <button onClick={disconnect} disabled={!connected}>Desconectar</button>
@@ -1976,6 +2083,8 @@ export default function App(){
                 <span className="result-chip">{analysis.flowDistributionSummary}</span>
               </div>
             </div>
+          </div>
+          <div className="grid" style={{marginTop:16}}>
             <div className="card result-card">
               <div className="result-title">Zona segura ({analysis.zoneShort})</div>
               <ResultStackedBar
@@ -1992,6 +2101,16 @@ export default function App(){
                 <span className="result-chip">{analysis.zoneLabel}</span>
                 {analysis.zoneDescription && <span className="result-chip subtle">{analysis.zoneDescription}</span>}
                 <span className="result-chip">{analysis.zoneSummary}</span>
+              </div>
+            </div>
+            <div className="card result-card">
+              <div className="result-title">Resumen general del shot</div>
+              <div className="metric-sm">{shotSummary.headline}</div>
+              <div className="small">{shotSummary.detail}</div>
+              <div className="result-chips">
+                {shotSummary.chips.map(chip=>(
+                  <span key={chip} className="result-chip">{chip}</span>
+                ))}
               </div>
             </div>
           </div>
@@ -2025,6 +2144,8 @@ export default function App(){
         </div>
 
         <div style={{marginTop:16, height:260}}><Line ref={chartRef} data={chartData} options={chartOptions}/></div>
+          </>
+        )}
 
         <div className="footer">Desarrollada por Jairon Francisco para Café Maguana/Escuela de Café</div>
       </div>
