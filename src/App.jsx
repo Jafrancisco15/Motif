@@ -1957,27 +1957,44 @@ export default function App(){
             </div>
             <div className="row" style={{gap:6}}>
               <button className={currentPage==='dashboard'?'primary':''} onClick={()=>setCurrentPage('dashboard')}>Panel</button>
+              <button className={currentPage==='simulator'?'primary':''} onClick={()=>setCurrentPage('simulator')}>Simulador</button>
               <button className={currentPage==='faq'?'primary':''} onClick={()=>setCurrentPage('faq')}>FAQ</button>
             </div>
           </div>
           <div className="row" style={{gap:12,alignItems:'flex-end',justifyContent:'flex-end'}}>
-            <div className="simulator-box">
-              <div className="sim-label">Simulador</div>
-              <div className="row" style={{gap:6,flexWrap:'nowrap'}}>
-                <button onClick={()=>simulateExtraction('optimal')} disabled={running||connecting||connected} title={connected?'Desconecta la balanza para simular.':''}>En rango</button>
-                <button onClick={()=>simulateExtraction('off')} disabled={running||connecting||connected} title={connected?'Desconecta la balanza para simular.':''}>Fuera de rango</button>
+            {currentPage==='simulator' ? (
+              <div className="simulator-box">
+                <div className="sim-label">Simulador</div>
+                <div className="row" style={{gap:6,flexWrap:'nowrap'}}>
+                  <button onClick={()=>simulateExtraction('optimal')} disabled={running||connecting||connected} title={connected?'Desconecta la balanza para simular.':''}>En rango</button>
+                  <button onClick={()=>simulateExtraction('off')} disabled={running||connecting||connected} title={connected?'Desconecta la balanza para simular.':''}>Fuera de rango</button>
+                </div>
+                <div className="sim-grid">
+                  <label>Peso bebida (g)<input type="number" min="1" step="0.1" value={simInputs.targetWeight} onChange={e=>setSimInputs(prev=>({...prev,targetWeight:e.target.value}))} /></label>
+                  <label>Tiempo total (s)<input type="number" min="8" step="0.1" value={simInputs.extractionTime} onChange={e=>setSimInputs(prev=>({...prev,extractionTime:e.target.value}))} /></label>
+                  <label>Primera gota (s)<input type="number" min="0.5" step="0.1" value={simInputs.firstDropTime} onChange={e=>setSimInputs(prev=>({...prev,firstDropTime:e.target.value}))} /></label>
+                  <label>Dosis café (g)<input type="number" min="1" step="0.1" value={simInputs.dose} onChange={e=>setSimInputs(prev=>({...prev,dose:e.target.value}))} /></label>
+                  <label>TDS (%)<input type="number" min="0" step="0.1" value={simInputs.tds} onChange={e=>setSimInputs(prev=>({...prev,tds:e.target.value}))} /></label>
+                  <label className="sim-check"><input type="checkbox" checked={simInputs.hasPreinfusion} onChange={e=>setSimInputs(prev=>({...prev,hasPreinfusion:e.target.checked}))} />Preinfusión</label>
+                </div>
+                <button onClick={runCustomSimulation} disabled={running||connecting||connected} title={connected?'Desconecta la balanza para simular.':''}>Simular con datos</button>
+                {simulatorStatus && <div className="sim-status">{simulatorStatus}</div>}
               </div>
-              <div className="sim-grid">
-                <label>Peso bebida (g)<input type="number" min="1" step="0.1" value={simInputs.targetWeight} onChange={e=>setSimInputs(prev=>({...prev,targetWeight:e.target.value}))} /></label>
-                <label>Tiempo total (s)<input type="number" min="8" step="0.1" value={simInputs.extractionTime} onChange={e=>setSimInputs(prev=>({...prev,extractionTime:e.target.value}))} /></label>
-                <label>Primera gota (s)<input type="number" min="0.5" step="0.1" value={simInputs.firstDropTime} onChange={e=>setSimInputs(prev=>({...prev,firstDropTime:e.target.value}))} /></label>
-                <label>Dosis café (g)<input type="number" min="1" step="0.1" value={simInputs.dose} onChange={e=>setSimInputs(prev=>({...prev,dose:e.target.value}))} /></label>
-                <label>TDS (%)<input type="number" min="0" step="0.1" value={simInputs.tds} onChange={e=>setSimInputs(prev=>({...prev,tds:e.target.value}))} /></label>
-                <label className="sim-check"><input type="checkbox" checked={simInputs.hasPreinfusion} onChange={e=>setSimInputs(prev=>({...prev,hasPreinfusion:e.target.checked}))} />Preinfusión</label>
+            ) : (
+              <div className="simulator-box">
+                <div className="sim-label">TARE y exportación</div>
+                <div className="row" style={{gap:6,justifyContent:'flex-end'}}>
+                  <button onClick={applyTare} disabled={!connected}>(TARE)</button>
+                  <button onClick={downloadCSV} disabled={samples.length===0}>Exportar CSV</button>
+                  <button onClick={downloadChartImage} disabled={samples.length===0}>Exportar gráfico</button>
+                </div>
+                <div className="row" style={{gap:6,justifyContent:'flex-end'}}>
+                  <input id="top-refw" type="number" step="0.1" placeholder="Peso de referencia (g)" style={{width:220}} />
+                  <button onClick={()=>{ const el=document.getElementById('top-refw'); const v=parseFloat(el.value); if(!isFinite(v)||v<=0) return alert('Valor inválido.'); spanCal(v) }} disabled={!connected}>Calibrar span</button>
+                </div>
+                <div className="sim-status">Usa TARE con la taza vacía; exporta CSV o gráfico cuando haya muestras.</div>
               </div>
-              <button onClick={runCustomSimulation} disabled={running||connecting||connected} title={connected?'Desconecta la balanza para simular.':''}>Simular con datos</button>
-              {simulatorStatus && <div className="sim-status">{simulatorStatus}</div>}
-            </div>
+            )}
             <span className="pill">{connected?`Conectado${deviceName?` a ${deviceName}`:''}`:'Desconectado'}</span>
           </div>
         </div>
@@ -1995,6 +2012,32 @@ export default function App(){
               ))}
             </div>
           </div>
+        ) : currentPage==='simulator' ? (
+          <>
+            <div className="row" style={{marginBottom:16}}>
+              <button onClick={resetCurve} disabled={!connected && !simulatorPlan}>Reset curva</button>
+              <button className="primary" onClick={start} disabled={(!connected && !simulatorPlan)||running}>Iniciar</button>
+              <button onClick={stop} disabled={!connected && !simulatorPlan}>Stop</button>
+            </div>
+            {errorMsg && <div className="error" style={{marginBottom:16}}>Error: {errorMsg}</div>}
+            <div className="section card" style={{marginBottom:16}}>
+              <h3 style={{marginTop:0}}>Simulador</h3>
+              <div className="sub" style={{marginBottom:12}}>Elige o configura una simulación en el panel externo derecho, luego pulsa Iniciar para reproducir datos en tiempo real.</div>
+              <div className="grid">
+                <div className="card" style={{padding:'16px'}}>
+                  <div className="sub">Peso simulado</div>
+                  <div className="metric-sm">{netG.toFixed(2)} <span className="sub">g</span></div>
+                  <div className="sub">Flujo: {flowGps.toFixed(2)} g/s</div>
+                </div>
+                <div className="card" style={{padding:'16px'}}>
+                  <div className="sub">Timer total</div>
+                  <div className="metric-sm">{formatTime(elapsed)}</div>
+                  <div className="sub">Estado: <span className="kbd">{running ? 'en curso' : simulatorPlan ? 'preparado' : 'sin simulación'}</span></div>
+                </div>
+              </div>
+            </div>
+            <div style={{marginTop:16, height:260}}><Line ref={chartRef} data={chartData} options={chartOptions}/></div>
+          </>
         ) : (
           <>
         <div className="row" style={{marginBottom:16}}>
@@ -2114,19 +2157,6 @@ export default function App(){
               </div>
             </div>
           </div>
-        </div>
-
-        <div className="section card" style={{marginBottom:16}}>
-          <div className="row" style={{flexWrap:'wrap',gap:12}}>
-            <button onClick={applyTare} disabled={!connected}>(TARE)</button>
-            <div className="row" style={{alignItems:'center',gap:8}}>
-              <input id="refw" type="number" step="0.1" placeholder="Peso de referencia (g)" style={{width:220}} />
-              <button onClick={()=>{ const el=document.getElementById('refw'); const v=parseFloat(el.value); if(!isFinite(v)||v<=0) return alert('Valor inválido.'); spanCal(v) }} disabled={!connected}>Calibrar span</button>
-            </div>
-            <button onClick={downloadCSV} disabled={samples.length===0}>Exportar CSV</button>
-            <button onClick={downloadChartImage} disabled={samples.length===0}>Exportar gráfico</button>
-          </div>
-          <div className="small" style={{marginTop:8}}>Flujo: derivada del peso neto. Usa <b>(TARE)</b> con la taza vacía y calibra con un peso conocido para ajustar <i>scale</i>.</div>
         </div>
 
         <div className="section card" style={{marginBottom:16}}>
