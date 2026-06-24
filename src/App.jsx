@@ -72,6 +72,80 @@ const interpolateNodes = (nodes, progress) => {
   return { min: end.min ?? 0, max: end.max ?? 0 }
 }
 
+const interpolateZoneRanges = (segments, progress) => {
+  if(!segments || !segments.length) return []
+
+  return segments
+    .map(segment=>{
+      const range = interpolateNodes(segment.nodes, progress)
+      if(!range) return null
+
+      const min = Number.isFinite(range.min) ? range.min : null
+      const max = Number.isFinite(range.max) ? range.max : null
+
+      if(min === null || max === null) return null
+      if(max <= min) return null
+      if(min === 0 && max === 0) return null
+
+      return {
+        ...range,
+        segmentId: segment.id,
+        label: segment.label || ''
+      }
+    })
+    .filter(Boolean)
+}
+
+const classifyFlowAgainstRanges = (flow, ranges) => {
+  if(!Number.isFinite(flow) || !ranges.length){
+    return { classification:'outside', gapValue:0, nearestRange:null }
+  }
+
+  const insideRange = ranges.find(range=>flow >= range.min && flow <= range.max)
+  if(insideRange){
+    return { classification:'inside', gapValue:0, nearestRange:insideRange }
+  }
+
+  let nearest = null
+  for(const range of ranges){
+    let gapValue = 0
+    let classification = 'outside'
+    if(flow < range.min){
+      gapValue = range.min - flow
+      classification = 'below'
+    }else if(flow > range.max){
+      gapValue = flow - range.max
+      classification = 'above'
+    }
+    if(!nearest || gapValue < nearest.gapValue){
+      nearest = { classification, gapValue, nearestRange:range }
+    }
+  }
+
+  return nearest || { classification:'outside', gapValue:0, nearestRange:null }
+}
+
+const standardDeviation = (values) => {
+  const clean = values.filter(Number.isFinite)
+  if(!clean.length) return 0
+  const avg = clean.reduce((sum, value)=>sum + value, 0) / clean.length
+  const variance = clean.reduce((sum, value)=>sum + ((value - avg) ** 2), 0) / clean.length
+  return Math.sqrt(variance)
+}
+
+const averageFlowByProgress = (samples, startProgress, endProgress) => {
+  if(!samples || samples.length < 2) return 0
+  const startTime = samples[0].t
+  const endTime = samples[samples.length - 1].t
+  const duration = Math.max(1e-6, endTime - startTime)
+  const selected = samples.filter(sample=>{
+    const progress = (sample.t - startTime) / duration
+    return progress >= startProgress && progress <= endProgress
+  })
+  if(!selected.length) return 0
+  return selected.reduce((sum, sample)=>sum + sample.flow, 0) / selected.length
+}
+
 const parseZoneCsv = (rawCsv) => {
   if(!rawCsv){
     return { segments: [], envelope: [] }
@@ -146,6 +220,7 @@ const FLOW_ZONE_PRESETS = Object.fromEntries(
       {
         ...meta,
         nodes: parsed.envelope.map(({ progress, min, max })=>({ progress, min, max })),
+        segments: parsed.segments,
         envelope: parsed.envelope
       }
     ]
@@ -448,6 +523,7 @@ export default function App(){
   const [elapsed,setElapsed]=useState(0)
   const [extractionInfo,setExtractionInfo]=useState({active:false,duration:0,lastDuration:0})
   const [simulatorStatus,setSimulatorStatus]=useState('')
+  const [simulatorPlan,setSimulatorPlan]=useState(null)
   const [simInputs,setSimInputs]=useState({
     targetWeight:36,
     extractionTime:28,
@@ -481,6 +557,7 @@ export default function App(){
   const runningRef=useRef(false)
   const chartRef=useRef(null)
   const importInputRef=useRef(null)
+  const simulatorIndexRef=useRef(0)
 
   useEffect(()=>{ runningRef.current=running },[running])
 
@@ -545,6 +622,7 @@ export default function App(){
   const analysis=useMemo(()=>{
     const zoneConfig=activeZone || FLOW_ZONE_PRESETS.SINPF
     const zoneNodes=zoneConfig?.nodes || []
+    const zoneSegments=zoneConfig?.segments || []
     const zoneMeta={
       id: zoneConfig?.id || 'SINPF',
       label: zoneConfig?.label || 'Zona segura',
@@ -558,7 +636,7 @@ export default function App(){
         avgFlow:0,
         peakFlow:0,
         hydraulicScore:0,
-        hydraulicSummary:'Sin datos suficientes para analizar la relación resistencia-flujo.',
+        hydraulicSummary:'Sin datos suficientes para analizar la uniformidad de flujo.',
         flowCorrelation:0,
         channelingIndex:0,
         channelingSpikes:0,
@@ -609,7 +687,7 @@ export default function App(){
         avgFlow:0,
         peakFlow:0,
         hydraulicScore:0,
-        hydraulicSummary:'Sin datos suficientes después de la preinfusión.',
+        hydraulicSummary:'Sin datos suficientes después del inicio de flujo sostenido.',
         flowCorrelation:0,
         channelingIndex:0,
         channelingSpikes:0,
@@ -653,15 +731,17 @@ export default function App(){
     const finalSlice=activeSamples.filter(s=>s.t>=finalWindowStart)
     const finalFlow=finalSlice.length? finalSlice.reduce((acc,s)=>acc+s.flow,0)/finalSlice.length : activeFlows[activeFlows.length-1]
 
-    const hydraulicRatio=peakFlow? avgFlow/peakFlow : 0
-    const hydraulicScore=Math.round(clamp((1-hydraulicRatio)*100,0,100))
+    const flowStd=standardDeviation(activeFlows)
+    const flowCv=avgFlow > 0 ? flowStd / avgFlow : 0
+    const uniformityScore=Math.round(clamp((1 - flowCv) * 100, 0, 100))
+    const hydraulicScore=uniformityScore
     const correlationFlowWeight=correlation(activeWeights, activeFlows)
 
     let hydraulicSummary
-    if(hydraulicScore>70){ hydraulicSummary='Resistencia muy alta: el flujo promedio es muy inferior al pico medido.' }
-    else if(hydraulicScore>45){ hydraulicSummary='Resistencia elevada: el flujo tarda en abrirse, revisa molienda y distribución.' }
-    else if(hydraulicScore>25){ hydraulicSummary='Resistencia moderada: la rampa de flujo es suave y consistente.' }
-    else { hydraulicSummary='Resistencia baja: el flujo es ágil; vigila que no se sobre-extraiga.' }
+    if(uniformityScore>=80){ hydraulicSummary='Flujo muy uniforme: la curva mantiene una entrega estable durante la extracción.' }
+    else if(uniformityScore>=60){ hydraulicSummary='Flujo razonablemente uniforme: hay variaciones, pero no dominan el tiro.' }
+    else if(uniformityScore>=40){ hydraulicSummary='Flujo irregular: revisa distribución, molienda y preparación del puck.' }
+    else { hydraulicSummary='Flujo muy inestable: patrón compatible con puck irregular, erosión o canalización.' }
     hydraulicSummary+=` Correlación flujo-peso: ${correlationFlowWeight.toFixed(2)}.`
 
     const flowMedian=median(activeFlows)
@@ -675,13 +755,6 @@ export default function App(){
       const spikeThreshold=flowMedian + 3*(flowMad||0.12)
       if(activeSamples[i].flow>spikeThreshold && accel>1){ spikeCount++ }
     }
-    const channelingIndex=Math.round(clamp((spikeCount/Math.max(1, activeSamples.length-1))*250,0,100))
-    let channelingSummary
-    if(channelingIndex>65){ channelingSummary='Canalización crítica: múltiples picos repentinos de flujo.' }
-    else if(channelingIndex>40){ channelingSummary='Canalización moderada: detectadas aceleraciones puntuales.' }
-    else if(channelingIndex>15){ channelingSummary='Canalización leve: el flujo presenta pequeñas irregularidades.' }
-    else { channelingSummary='Canalización mínima: la curva es uniforme.' }
-
     let timeOptimal=0, timeLow=0, timeHigh=0
     for(let i=1;i<activeSamples.length;i++){
       const dt=Math.max(0, activeSamples[i].t-activeSamples[i-1].t)
@@ -698,10 +771,10 @@ export default function App(){
     }
 
     let flowDistributionSummary
-    if(flowDistribution.optimal>60){ flowDistributionSummary='Mayor parte de la extracción dentro del rango clásico de espresso.' }
-    else if(flowDistribution.high>flowDistribution.low){ flowDistributionSummary='Flujo alto predominante: probable sub-extracción o canalización.' }
-    else if(flowDistribution.low>flowDistribution.high){ flowDistributionSummary='Flujo bajo predominante: posible sobre-extracción por alta resistencia.' }
-    else { flowDistributionSummary='Distribución equilibrada pero con variaciones que conviene revisar.' }
+    if(flowDistribution.optimal>60){ flowDistributionSummary='Mayor parte de la extracción dentro de la referencia clásica de flujo.' }
+    else if(flowDistribution.high>flowDistribution.low){ flowDistributionSummary='Flujo alto frente a la referencia clásica; confirma con la zona segura activa antes de ajustar.' }
+    else if(flowDistribution.low>flowDistribution.high){ flowDistributionSummary='Flujo bajo frente a la referencia clásica; confirma con la zona segura activa antes de ajustar.' }
+    else { flowDistributionSummary='Distribución mixta frente a la referencia clásica; prioriza la zona segura activa.' }
 
     const targetPeak=peakFlow||finalFlow||avgFlow
     let rampTime=0
@@ -720,6 +793,7 @@ export default function App(){
     for(let i=0;i<activeSamples.length;i++){
       const progress = activeDuration>0 ? (activeSamples[i].t-activeTimes[0]) / Math.max(activeDuration, 1e-6) : 0
       const envelopeRange = interpolateNodes(zoneNodes, progress) || { min:0, max:0 }
+      const diagnosticRanges = interpolateZoneRanges(zoneSegments, progress)
       zoneGuide.push({
         t: activeSamples[i].t,
         min: envelopeRange.min,
@@ -728,17 +802,7 @@ export default function App(){
       if(i===0) continue
       const dt=Math.max(0, activeSamples[i].t-activeSamples[i-1].t)
       const flow=activeSamples[i].flow
-      let classification
-      let gapValue=0
-      if(flow>=envelopeRange.min && flow<=envelopeRange.max){
-        classification='inside'
-      }else if(flow<envelopeRange.min){
-        classification='below'
-        gapValue=envelopeRange.min-flow
-      }else{
-        classification='above'
-        gapValue=flow-envelopeRange.max
-      }
+      const { classification, gapValue } = classifyFlowAgainstRanges(flow, diagnosticRanges)
       if(classification==='inside'){
         zoneInside+=dt
       }else if(classification==='below'){
@@ -762,9 +826,9 @@ export default function App(){
     if(zoneCoverage.inside>65){
       zoneNarrative='Extracción alineada con la zona recomendada durante la mayor parte del tiro.'
     }else if(zoneCoverage.above>zoneCoverage.below){
-      zoneNarrative='Predominan caudales por encima de la zona; riesgo de sub-extracción o canalización.'
+      zoneNarrative='Predominan caudales por encima de la zona; patrón sospechoso compatible con salida por encima de zona.'
     }else if(zoneCoverage.below>zoneCoverage.above){
-      zoneNarrative='Predominan caudales por debajo de la zona; posible sobre-extracción por resistencia alta.'
+      zoneNarrative='Predominan caudales por debajo de la zona; revisa molienda y preparación del puck.'
     }else{
       zoneNarrative='Flujo alternando entre los límites recomendados; ajusta distribución y molienda.'
     }
@@ -772,6 +836,30 @@ export default function App(){
       zoneNarrative+=` Picos fuera de zona de hasta ${zoneMaxGap.toFixed(2)} g/s.`
     }
     const zoneSummary=`Zona ${zoneMeta.short}: ${zoneNarrative}`
+
+    const midFlow=averageFlowByProgress(activeSamples, 0.35, 0.65)
+    const lateFlow=averageFlowByProgress(activeSamples, 0.80, 0.95)
+    const lateAccelerationRatio=midFlow > 0 ? lateFlow / midFlow : 1
+    const lateAccelerationScore=Math.round(clamp(((lateAccelerationRatio - 1.15) / 0.85) * 100, 0, 100))
+    const spikeScore=Math.round(clamp((spikeCount / 3) * 100, 0, 100))
+    const aboveZoneScore=zoneCoverage.above || 0
+    const instabilityScore=Math.round(clamp((1 - uniformityScore / 100) * 100, 0, 100))
+    const accelerationScore=Math.round(clamp((maxAccel / 6) * 100, 0, 100))
+    const channelingIndex=Math.round(clamp(
+      (0.30 * aboveZoneScore) +
+      (0.25 * lateAccelerationScore) +
+      (0.20 * spikeScore) +
+      (0.15 * instabilityScore) +
+      (0.10 * accelerationScore),
+      0,
+      100
+    ))
+    let channelingSummary
+    if(channelingIndex>=70){ channelingSummary='Patrón fuertemente compatible con canalización o degradación del puck: exceso de flujo sobre zona, aceleración final o picos marcados.' }
+    else if(channelingIndex>=45){ channelingSummary='Patrón moderadamente compatible con canalización: revisa distribución, nivelación y molienda.' }
+    else if(channelingIndex>=25){ channelingSummary='Irregularidad leve: hay señales de aceleración o salida fuera de zona, pero no dominan el tiro.' }
+    else { channelingSummary='Curva estable: pocas señales compatibles con canalización.' }
+
 
     return {
       preinfusionDuration:Math.max(0, preinfusionDuration),
@@ -841,6 +929,7 @@ export default function App(){
       charRef.current=characteristic
       setDeviceName(device.name||'')
       setConnected(true)
+      setSimulatorPlan(null)
       await ensureNotifications()
     }catch(err){
       onDisconnect()
@@ -996,10 +1085,20 @@ export default function App(){
   }
 
   function start(){
-    if(!charRef.current) return
+    if(!charRef.current && !simulatorPlan) return
     resetRunState()
+    if(simulatorPlan){
+      simulatorIndexRef.current=0
+      setAbsG(0)
+      setNetG(0)
+      setTareApplied(true)
+      setTareValueG(0)
+      setTareTime(new Date().toISOString())
+      setSimulatorStatus('Simulación en curso')
+    }else{
+      setSimulatorStatus('')
+    }
     setRunning(true)
-    setSimulatorStatus('')
   }
 
   function stop(){
@@ -1091,6 +1190,7 @@ export default function App(){
     setRunning(false)
     runningRef.current=false
     setSimulatorStatus('')
+    setSimulatorPlan(null)
   }
 
   const chartData=useMemo(()=>{
@@ -1240,9 +1340,9 @@ export default function App(){
       const safeFixed=(value,digits=2)=>Number.isFinite(value)? value.toFixed(digits): (0).toFixed(digits)
       const cards=[
         {
-          title:'Relación resistencia-flujo',
+          title:'Uniformidad de flujo',
           bars:[
-            { label:'Índice hidráulico', value:analysis.hydraulicScore, max:100, unit:'', decimals:0, color:'#38bdf8' },
+            { label:'Uniformidad de flujo', value:analysis.hydraulicScore, max:100, unit:'', decimals:0, color:'#38bdf8' },
             { label:'Flujo promedio', value:analysis.avgFlow, max:5, unit:' g/s', decimals:2, color:'#60a5fa' },
             { label:'Pico de flujo', value:analysis.peakFlow, max:5, unit:' g/s', decimals:2, color:'#22d3ee' },
             { label:'Flujo final', value:analysis.finalFlow, max:5, unit:' g/s', decimals:2, color:'#0ea5e9' },
@@ -1262,7 +1362,7 @@ export default function App(){
         {
           title:'Distribución del flujo',
           stacked:{
-            label:`Rango óptimo ${FLOW_OPTIMAL_MIN}-${FLOW_OPTIMAL_MAX} g/s`,
+            label:`Referencia clásica ${FLOW_OPTIMAL_MIN}-${FLOW_OPTIMAL_MAX} g/s`,
             segments:[
               { label:'Bajo', value:analysis.flowDistribution.low, color:'#64748b' },
               { label:'Óptimo', value:analysis.flowDistribution.optimal, color:'#22c55e' },
@@ -1270,7 +1370,7 @@ export default function App(){
             ]
           },
           bars:[
-            { label:'Preinfusión', value:analysis.preinfusionDuration>0?analysis.preinfusionDuration:0, max:10, unit:' s', decimals:1, color:'#4ade80' },
+            { label:'Latencia de percolación', value:analysis.preinfusionDuration>0?analysis.preinfusionDuration:0, max:10, unit:' s', decimals:1, color:'#4ade80' },
             { label:'Flujo mínimo', value:analysis.minFlow, max:5, unit:' g/s', decimals:2, color:'#2dd4bf' }
           ],
           notes:[analysis.flowDistributionSummary]
@@ -1685,26 +1785,56 @@ export default function App(){
     }
   },[running, samples])
 
+  useEffect(()=>{
+    if(!simulatorPlan || !running) return
+    const intervalMs=Math.max(50, Math.round((simulatorPlan.dt || 0.25) * 1000))
+    const interval=setInterval(()=>{
+      const idx=simulatorIndexRef.current
+      const sample=simulatorPlan.samples[idx]
+      if(!sample){
+        setRunning(false)
+        runningRef.current=false
+        setFlowGps(0)
+        startTimeRef.current=null
+        lastCapturedRef.current=null
+        setExtractionInfo({active:false,duration:0,lastDuration:simulatorPlan.extractionDuration || 0})
+        setSimulatorStatus(simulatorPlan.doneStatus || 'Simulación lista')
+        return
+      }
+      simulatorIndexRef.current=idx+1
+      const nextSample={ t:sample.t, g:sample.g, flow:sample.flow }
+      setSamples(prev=>{
+        const next=[...prev, nextSample]
+        return next.length>1800? next.slice(next.length-1800) : next
+      })
+      setAbsG(Number(nextSample.g.toFixed(2)))
+      setNetG(Number(nextSample.g.toFixed(2)))
+      setFlowGps(Number(nextSample.flow.toFixed(3)))
+      setElapsed(Number(nextSample.t.toFixed(2)))
+      flowRef.current={ time:performance.now(), net:nextSample.g }
+      if(nextSample.g>=1 && !extractionRef.current.active){
+        extractionRef.current={ baseline:0, hasBaseline:true, active:true, start:performance.now(), lastRiseTime:performance.now(), lastRiseWeight:nextSample.g }
+        setExtractionInfo(prev=>({active:true,duration:0,lastDuration:prev.lastDuration}))
+      }else if(extractionRef.current.active){
+        setExtractionInfo(prev=>({ ...prev, active:true, duration:Math.max(0, Number((nextSample.t - (simulatorPlan.firstFlowTime || 0)).toFixed(2))) }))
+      }
+    }, intervalMs)
+    return ()=>clearInterval(interval)
+  },[simulatorPlan, running])
+
   function simulateExtraction(mode){
     const result=generateSimulatedExtraction(mode)
-    resetFilters()
-    runningRef.current=false
-    setRunning(false)
-    startTimeRef.current=null
-    lastCapturedRef.current=null
-    extractionRef.current={ baseline:0, hasBaseline:true, active:false, start:0, lastRiseTime:0, lastRiseWeight:0 }
-    flowRef.current={ time:null, net:result.finalWeight }
-    setSamples(result.samples)
-    setAbsG(Number(result.finalWeight.toFixed(2)))
-    setNetG(Number(result.finalWeight.toFixed(2)))
-    setFlowGps(0)
-    setElapsed(Number(result.totalDuration.toFixed(2)))
-    setExtractionInfo({active:false,duration:0,lastDuration:result.extractionDuration})
-    setTareApplied(true)
-    setTareValueG(0)
-    setTareTime(new Date().toISOString())
+    stop()
+    resetRunState()
+    const firstFlow = result.samples.find(sample=>sample.g>=1)?.t || 0
+    setSimulatorPlan({
+      ...result,
+      dt:result.samples[1]?.t - result.samples[0]?.t || 0.25,
+      firstFlowTime:firstFlow,
+      doneStatus:`Simulación ${mode==='optimal'?'en rango':`fuera de rango (${result.profileLabel})`} lista`
+    })
     setErrorMsg('')
-    setSimulatorStatus(`Simulación ${mode==='optimal'?'en rango':`fuera de rango (${result.profileLabel})`} lista`)
+    setSimulatorStatus('Simulación preparada; pulsa Iniciar')
   }
 
   function runCustomSimulation(){
@@ -1713,24 +1843,17 @@ export default function App(){
       ...simInputs,
       tds: parsedTds
     })
-    resetFilters()
-    runningRef.current=false
-    setRunning(false)
-    startTimeRef.current=null
-    lastCapturedRef.current=null
-    extractionRef.current={ baseline:0, hasBaseline:true, active:false, start:0, lastRiseTime:0, lastRiseWeight:0 }
-    flowRef.current={ time:null, net:result.finalWeight }
-    setSamples(result.samples)
-    setAbsG(Number(result.finalWeight.toFixed(2)))
-    setNetG(Number(result.finalWeight.toFixed(2)))
-    setFlowGps(0)
-    setElapsed(Number(result.totalDuration.toFixed(2)))
-    setExtractionInfo({active:false,duration:0,lastDuration:result.extractionDuration})
-    setTareApplied(true)
-    setTareValueG(0)
-    setTareTime(new Date().toISOString())
+    stop()
+    resetRunState()
+    const firstFlow = result.samples.find(sample=>sample.g>=1)?.t || Number(simInputs.firstDropTime) || 0
+    setSimulatorPlan({
+      ...result,
+      dt:result.samples[1]?.t - result.samples[0]?.t || 0.25,
+      firstFlowTime:firstFlow,
+      doneStatus:'Simulación personalizada lista'
+    })
     setErrorMsg('')
-    setSimulatorStatus('Simulación personalizada lista')
+    setSimulatorStatus('Simulación preparada; pulsa Iniciar')
   }
 
   return (
@@ -1770,9 +1893,9 @@ export default function App(){
         <div className="row" style={{marginBottom:16}}>
           <button className="primary" disabled={connecting||connected} onClick={connect}>{connecting?'Escaneando…':'Conectar'}</button>
           <button onClick={disconnect} disabled={!connected}>Desconectar</button>
-          <button onClick={resetCurve} disabled={!connected}>Reset curva</button>
-          <button className="primary" onClick={start} disabled={!connected||running}>Iniciar</button>
-          <button onClick={stop} disabled={!connected}>Stop</button>
+          <button onClick={resetCurve} disabled={!connected && !simulatorPlan}>Reset curva</button>
+          <button className="primary" onClick={start} disabled={(!connected && !simulatorPlan)||running}>Iniciar</button>
+          <button onClick={stop} disabled={!connected && !simulatorPlan}>Stop</button>
         </div>
 
         {errorMsg && <div className="error" style={{marginBottom:16}}>Error: {errorMsg}</div>}
@@ -1817,8 +1940,8 @@ export default function App(){
           </div>
           <div className="grid" style={{marginTop:12}}>
             <div className="card result-card">
-              <div className="result-title">Relación resistencia-flujo</div>
-              <HorizontalMetricBar label="Índice hidráulico" value={analysis.hydraulicScore} max={100} color="#38bdf8" />
+              <div className="result-title">Uniformidad de flujo</div>
+              <HorizontalMetricBar label="Uniformidad de flujo" value={analysis.hydraulicScore} max={100} color="#38bdf8" />
               <HorizontalMetricBar label="Flujo promedio" value={analysis.avgFlow} max={5} unit=" g/s" color="#60a5fa" decimals={2} />
               <HorizontalMetricBar label="Pico de flujo" value={analysis.peakFlow} max={5} unit=" g/s" color="#22d3ee" decimals={2} />
               <HorizontalMetricBar label="Flujo final" value={analysis.finalFlow} max={5} unit=" g/s" color="#0ea5e9" decimals={2} />
@@ -1840,14 +1963,14 @@ export default function App(){
             <div className="card result-card">
               <div className="result-title">Distribución del flujo</div>
               <ResultStackedBar
-                label={`Rango óptimo ${FLOW_OPTIMAL_MIN}-${FLOW_OPTIMAL_MAX} g/s`}
+                label={`Referencia clásica ${FLOW_OPTIMAL_MIN}-${FLOW_OPTIMAL_MAX} g/s`}
                 segments={[
                   { key:'low', label:'Bajo', value:analysis.flowDistribution.low, color:'#64748b' },
                   { key:'opt', label:'Óptimo', value:analysis.flowDistribution.optimal, color:'#22c55e' },
                   { key:'high', label:'Alto', value:analysis.flowDistribution.high, color:'#f97316' }
                 ]}
               />
-              <HorizontalMetricBar label="Preinfusión" value={analysis.preinfusionDuration} max={10} unit=" s" color="#4ade80" decimals={1} />
+              <HorizontalMetricBar label="Latencia de percolación" value={analysis.preinfusionDuration} max={10} unit=" s" color="#4ade80" decimals={1} />
               <HorizontalMetricBar label="Flujo mínimo" value={analysis.minFlow} max={5} unit=" g/s" color="#2dd4bf" decimals={2} />
               <div className="result-chips">
                 <span className="result-chip">{analysis.flowDistributionSummary}</span>
